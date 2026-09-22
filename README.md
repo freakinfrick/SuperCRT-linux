@@ -137,29 +137,31 @@ manager's own switcher (**Alt-Tab**), which does not go through the pointer.
 ## Never sampling itself
 
 The capture reads the desktop, and the viewer draws to the desktop, so if the viewer overlaps
-the rectangle it samples it feeds its own output back in: the image cascades, and the sampled
-area is no longer what is really there. **`IgnoreSelf`** (on by default) makes that impossible,
-two ways:
+the rectangle it samples it feeds its own output back in: the image cascades into a tunnel, and
+the sampled area stops being what is really there. **`IgnoreSelf`** (on by default) prevents that
+without the viewer having to give anything up — it still paints its CRT image over everything,
+fullscreen included.
 
-- **It keeps clear.** `App_WindowPlacement` already worked out a spot beside or below the
-  sampled rectangle, but that was only a request — window managers routinely ignore the geometry
-  a new window is created with, and KWin did exactly that, leaving the viewer on top of the
-  rectangle it was sampling. The placement is now asserted through `USPosition` hints and
-  re-requested for the first moment after the window appears, then left alone so a move you make
-  yourself is never fought.
-- **It punches a hole in itself.** Whenever the window would overlap the rectangle anyway — you
-  dragged it there, the screen is too small, or you are in fullscreen or borderless mode where
-  covering it is unavoidable — the viewer's bounding shape is cut so it paints everything
-  *except* the sampled rectangle. Those pixels stay exactly as the desktop drew them, so the
-  capture cannot contain the viewer's output no matter where the window is. The input shape gets
-  the same hole, so a pixel the viewer does not paint is also one it does not swallow.
+- **It prefers to keep clear.** `App_WindowPlacement` works out a spot beside or below the
+  sampled rectangle, and that is only a request: window managers routinely ignore the geometry a
+  new window is created with — KWin did exactly that, dropping the viewer on top of the rectangle
+  it samples. So the placement is asserted through `USPosition` hints and re-requested until the
+  window is clear or a second and a half has passed, then left alone so a move you make yourself
+  is never fought.
+- **Where it does overlap, it reads underneath.** The screen grab is the base layer, but the part
+  of the rectangle the viewer covers is re-read from the windows below it, through XComposite: the
+  viewer's footprint is replaced by what is actually behind it, topmost window last. Those pixels
+  are what the screen shows there once the viewer is discounted, so the sampled image is right no
+  matter where the window sits.
 
-What you see in that case is a raw, un-CRT'd rectangle inside the viewer wherever it overlaps
-the sampled area — the desktop showing through the glass, which is the honest picture: those
-pixels are what is being sampled.
+Two things worth knowing. Reading a window's own pixels requires the Composite extension, which
+is `dlopen`ed at runtime like libXext — without it, nothing is read from below and the footprint
+comes out black. And a patch of bare desktop under the viewer also comes out black rather than as
+wallpaper: there is no window there to ask, and the desktop's own pixels are only reachable
+through one. Sample a window and neither case arises.
 
-With `IgnoreSelf=false` the old behaviour returns, including the feedback tunnel, which is
-worth having as an effect if you want it. `i` in the overlay toggles it.
+With `IgnoreSelf=false` the tunnel returns, deliberately, as an effect. `i` in the overlay
+toggles it.
 
 ## Pipeline
 
@@ -176,7 +178,7 @@ Six passes, matching the reference `Render()`:
 | File | Role |
 |---|---|
 | `src/main.c` | Window, GL context, render loop, pipeline, input |
-| `src/capture.c` | X11 screen capture (MIT-SHM + `XGetImage`) |
+| `src/capture.c` | Screen grabs (MIT-SHM + `XGetImage`) and window grabs via XComposite |
 | `src/shader.c`, `src/shaders.h` | GLSL programs / the translated shader source |
 | `src/assets.c` | BMP and `.m3d` loaders for the upstream data files |
 | `src/params.c`, `src/params.h` | Tunables, INI load/save, defaults |

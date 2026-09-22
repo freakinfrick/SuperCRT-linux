@@ -29,6 +29,22 @@ typedef struct {
 // the source image as empty).
 int Capture_Grab(Capture *c, int x, int y, int width, int height, CaptureRegion *out);
 
+// Grabs from an arbitrary drawable instead of the root -- used to re-read the pixels under the
+// viewer from the window beneath it.  The region must already lie inside `d`: there is no screen
+// clipping here, because the caller has intersected it.  Only root grabs use MIT-SHM; a window
+// grab always goes through XGetImage, so a refusal cannot disable sharing for the common path.
+int Capture_GrabDrawable(Capture *c, Drawable d, int x, int y, int width, int height,
+                         CaptureRegion *out);
+
+// Grabs from a *window*, whose contents are read through XComposite rather than off the screen.
+// A window covered by another has no readable pixels of its own -- on a plain server without a
+// compositor, reading one returns black even when it is fully visible -- so the window is
+// redirected to an offscreen pixmap first, which is what makes "what is underneath the viewer"
+// answerable at all.  Returns 0 when the composite extension is missing or the window cannot be
+// redirected, in which case the caller should leave those pixels alone rather than invent them.
+int Capture_GrabWindow(Capture *c, Window win, int x, int y, int width, int height,
+                       CaptureRegion *out);
+
 // Buffer describing the most recent grab: BGRX (or BGR) rows, top row first, which is
 // exactly what GL_BGRA/GL_BGR uploads expect.
 unsigned char *Capture_Data(const Capture *c);

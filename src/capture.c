@@ -40,7 +40,24 @@ struct Capture {
     Bool (*pGetImage)(Display *, Drawable, XImage *, int, int, unsigned long);
     XShmSegmentInfoLocal shminfo;
     int shm_attached;
+
+    // XComposite, for reading a window's own pixels through its offscreen pixmap.
+    void *xcomposite;
+    Pixmap (*pNameWindowPixmap)(Display *, Window);
+    void (*pRedirectWindow)(Display *, Window, int);
 };
+
+#define COMPOSITE_REDIRECT_AUTOMATIC 0
+
+static volatile int g_composite_error;
+
+static int Capture_QuietXError(Display *dpy, XErrorEvent *ev)
+{
+    (void)dpy;
+    (void)ev;
+    g_composite_error = 1;
+    return 0;
+}
 
 static void Capture_FreeImage(Capture *c)
 {
@@ -79,6 +96,16 @@ Capture *Capture_Create(Display *dpy, int screen)
     c->screen_w = DisplayWidth(dpy, screen);
     c->screen_h = DisplayHeight(dpy, screen);
 
+    // XComposite ships separately from Xext; without it a window's own pixels are unreadable and
+    // the caller is told so rather than handed black.
+    c->xcomposite = dlopen("libXcomposite.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (c->xcomposite) {
+        c->pNameWindowPixmap =
+            (Pixmap (*)(Display *, Window))dlsym(c->xcomposite, "XCompositeNameWindowPixmap");
+        c->pRedirectWindow = (void (*)(Display *, Window, int))
+            dlsym(c->xcomposite, "XCompositeRedirectWindow");
+    }
+
     c->xext = dlopen("libXext.so.6", RTLD_NOW | RTLD_LOCAL);
     if (c->xext) {
         c->pQueryExtension = (Bool (*)(Display *))dlsym(c->xext, "XShmQueryExtension");
@@ -108,9 +135,10 @@ void Capture_Destroy(Capture *c)
         return;
     }
     Capture_FreeImage(c);
-    if (c->xext) {
-        dlclose(c->xext);
-    }
+    // Both libraries are left loaded: Xlib keeps per-extension callbacks that point into them and
+    // walks them during XCloseDisplay, so unloading here risks jumping into freed code.
+    (void)c->xext;
+    (void)c->xcomposite;
     free(c);
 }
 
@@ -184,11 +212,32 @@ int Capture_Grab(Capture *c, int x, int y, int width, int height, CaptureRegion 
         return 0;
     }
 
-    const int grab_w = x1 - x0;
-    const int grab_h = y1 - y0;
+    CaptureRegion grabbed;
+    if (!Capture_GrabDrawable(c, c->root, x0, y0, x1 - x0, y1 - y0, &grabbed)) {
+        return 0;
+    }
+    // The drawable variant reports the region in its own coordinates; the root's are the
+    // screen's, so shift back to where the caller asked for.
+    grabbed.offset_x += x0 - x;
+    grabbed.offset_y += y0 - y;
+    *out = grabbed;
+    return 1;
+}
+
+int Capture_GrabDrawable(Capture *c, Drawable d, int x, int y, int width, int height,
+                         CaptureRegion *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (width <= 0 || height <= 0 || x < 0 || y < 0) {
+        return 0;
+    }
+
+    const int grab_w = width;
+    const int grab_h = height;
+    const int use_shm = c->use_shm && d == c->root;
 
     if (!c->image || c->image_w != grab_w || c->image_h != grab_h) {
-        if (c->use_shm) {
+        if (use_shm) {
             if (!Capture_Resize(c, grab_w, grab_h)) {
                 return 0;
             }
@@ -198,20 +247,21 @@ int Capture_Grab(Capture *c, int x, int y, int width, int height, CaptureRegion 
         }
     }
 
-    if (c->use_shm) {
-        if (!c->pGetImage(c->dpy, c->root, c->image, x0, y0, AllPlanes)) {
+    if (use_shm) {
+        if (!c->pGetImage(c->dpy, d, c->image, x, y, AllPlanes)) {
             fprintf(stderr, "supercrt: XShmGetImage failed, falling back to XGetImage\n");
             c->use_shm = 0;
             Capture_FreeImage(c);
             c->image = NULL;
         }
     }
-    if (!c->use_shm) {
-        if (c->image) {
+    if (!use_shm || !c->image) {
+        if (c->image && !c->image_owned_by_xlib) {
+            Capture_FreeImage(c);
+        } else if (c->image) {
             XDestroyImage(c->image);
-            c->image = NULL;
         }
-        c->image = XGetImage(c->dpy, c->root, x0, y0, (unsigned int)grab_w, (unsigned int)grab_h,
+        c->image = XGetImage(c->dpy, d, x, y, (unsigned int)grab_w, (unsigned int)grab_h,
                              AllPlanes, ZPixmap);
         if (!c->image) {
             fprintf(stderr, "supercrt: XGetImage failed\n");
@@ -220,13 +270,56 @@ int Capture_Grab(Capture *c, int x, int y, int width, int height, CaptureRegion 
         c->image_owned_by_xlib = 1;
     }
 
-    out->x = x0;
-    out->y = y0;
+    out->x = x;
+    out->y = y;
+    out->x = x;
+    out->y = y;
     out->width = grab_w;
     out->height = grab_h;
-    out->offset_x = x0 - x;
-    out->offset_y = y0 - y;
+    out->offset_x = 0; // nothing was clipped away: this grabbed exactly what was asked for
+    out->offset_y = 0;
     return 1;
+}
+
+// The pixmap holding this window's own pixels, redirecting it first if nobody has.  NameWindowPixmap
+// fails (BadMatch) on a window that is not redirected, and an error handler that does not exit is
+// required for that probe: Xlib's default one ends the process.
+static Pixmap Capture_WindowPixmap(Capture *c, Window win)
+{
+    if (!c->pNameWindowPixmap || !c->pRedirectWindow) {
+        return None;
+    }
+
+    int (*previous)(Display *, XErrorEvent *) = XSetErrorHandler(Capture_QuietXError);
+    g_composite_error = 0;
+    Pixmap px = c->pNameWindowPixmap(c->dpy, win);
+    XSync(c->dpy, False);
+
+    if (!px || g_composite_error) {
+        // Not redirected yet: do it ourselves.  Automatic redirection keeps the window on screen
+        // exactly as before while also keeping its contents in an offscreen pixmap.
+        g_composite_error = 0;
+        c->pRedirectWindow(c->dpy, win, COMPOSITE_REDIRECT_AUTOMATIC);
+        XSync(c->dpy, False);
+        px = c->pNameWindowPixmap(c->dpy, win);
+        XSync(c->dpy, False);
+        if (g_composite_error) {
+            px = None;
+        }
+    }
+    XSetErrorHandler(previous);
+    return px;
+}
+
+int Capture_GrabWindow(Capture *c, Window win, int x, int y, int width, int height,
+                       CaptureRegion *out)
+{
+    memset(out, 0, sizeof(*out));
+    const Pixmap px = Capture_WindowPixmap(c, win);
+    if (px == None) {
+        return 0;
+    }
+    return Capture_GrabDrawable(c, px, x, y, width, height, out);
 }
 
 unsigned char *Capture_Data(const Capture *c)

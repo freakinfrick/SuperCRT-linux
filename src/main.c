@@ -242,10 +242,10 @@ typedef struct {
     int capture_outline_enabled;
     int on_top_applied;          // last value pushed to the WM, -1 to force a re-apply
     int click_through_applied;   // likewise for the input shape
-    int ignore_self_applied;     // likewise for the self-capture hole
     int hotkey_grabbed;
-    int placement_frames;        // frames left to insist on the requested window placement
-    int self_shape_dirty;        // geometry or the sampled rectangle moved: re-cut the hole
+    int placement_state;         // 0 asking, 1 clear of the rectangle, 2 given up
+    double placement_until;      // wall-clock deadline for the asking
+    int root_depth;              // depth to insist on when reading pixels from windows below
     double last_fps_time;
     int fps_frames;
     double fps;
@@ -689,9 +689,11 @@ static int App_HasWindowManager(Display *dpy, Window root)
 
 // How long to keep asking for the placement App_WindowPlacement computed.  Window managers
 // routinely place a new window themselves and ignore the geometry XCreateWindow was handed --
-// KWin does, which is how the viewer ended up sitting over the rectangle it samples.  Bounded
-// so a deliberate move by the user is never fought; past that the hole covers any overlap.
-#define PLACEMENT_FRAMES 90
+// KWin does, which is how the viewer ended up sitting over the rectangle it samples.  Measured
+// in seconds, not frames: a software-rendered window can manage a handful of frames a second,
+// and 90 frames then means half a minute of yanking the window back while its owner is trying
+// to move it, which reads as "this window cannot be moved".
+#define PLACEMENT_SECONDS 1.5
 
 static void App_CreateWindow(App *a, int override_redirect, int width, int height)
 {
@@ -766,9 +768,8 @@ static void App_CreateWindow(App *a, int override_redirect, int width, int heigh
     // WM state and input shapes belong to the window that was just thrown away.
     a->on_top_applied = -1;
     a->click_through_applied = -1;
-    a->ignore_self_applied = -1;
-    a->self_shape_dirty = 1;
-    a->placement_frames = PLACEMENT_FRAMES;
+    a->placement_state = 0;
+    a->placement_until = NowSeconds() + PLACEMENT_SECONDS;
 }
 
 // ---------------------------------------------------------------------------
@@ -807,21 +808,23 @@ static void App_SetOnTop(App *a, int on)
 // Not sampling ourselves
 // ---------------------------------------------------------------------------
 
-// Where the sampled rectangle lands in this window's coordinates, or 0 width/height when the
-// two do not overlap.  The viewer draws its own output, and the capture reads the root window,
-// so any overlap feeds that output straight back into the next frame -- the tunnel effect.  On
-// plain X11 a root capture cannot exclude a window, so instead the window is made not to paint
-// there at all (see App_ApplySelfShape).
-static void App_SelfHole(App *a, int out[4])
+// The part of the sampled rectangle this window covers, in **root coordinates**: what the
+// capture has to get from somewhere other than the screen, because the viewer's own output must
+// never appear in it.  Returns 0 when they do not overlap.
+//
+// A screen grab cannot exclude a window, so the viewer is free to sit over the rectangle and the
+// pixels underneath it are re-read from the windows below instead -- see App_GrabSource.  With
+// IgnoreSelf off this reports nothing, the screen grab stands, and the feedback tunnel returns.
+static int App_SourceCoverage(App *a, int out[4])
 {
     out[0] = out[1] = out[2] = out[3] = 0;
     if (!g_params.IgnoreSelf || !a->win) {
-        return;
+        return 0;
     }
     int rx = 0, ry = 0;
     Window child = None;
     if (!XTranslateCoordinates(a->dpy, a->win, a->root, 0, 0, &rx, &ry, &child)) {
-        return;
+        return 0;
     }
 
     const int sx1 = g_params.SrcX + g_params.SrcWidth;
@@ -831,51 +834,17 @@ static void App_SelfHole(App *a, int out[4])
     const int hx1 = sx1 < rx + a->width ? sx1 : rx + a->width;
     const int hy1 = sy1 < ry + a->height ? sy1 : ry + a->height;
     if (hx1 <= hx0 || hy1 <= hy0) {
-        return;
+        return 0;
     }
-    out[0] = hx0 - rx;
-    out[1] = hy0 - ry;
+    out[0] = hx0;
+    out[1] = hy0;
     out[2] = hx1 - hx0;
     out[3] = hy1 - hy0;
-}
-
-// This window's own pixels: everything but the hole, as up to four rectangles.  Bounding and
-// input share the list, so a pixel this window does not paint is also one it does not swallow.
-static int App_WindowRegion(App *a, XRectangle out[4])
-{
-    const int w = a->width > 0 ? a->width : 1;
-    const int h = a->height > 0 ? a->height : 1;
-    int hole[4];
-    App_SelfHole(a, hole);
-
-    if (hole[2] <= 0 || hole[3] <= 0) {
-        out[0] = (XRectangle){ 0, 0, (unsigned short)w, (unsigned short)h };
-        return 1;
-    }
-
-    const short hx0 = (short)hole[0];
-    const short hy0 = (short)hole[1];
-    const short hx1 = (short)(hole[0] + hole[2]);
-    const short hy1 = (short)(hole[1] + hole[3]);
-    int n = 0;
-    if (hy0 > 0) {
-        out[n++] = (XRectangle){ 0, 0, (unsigned short)w, (unsigned short)hy0 };
-    }
-    if (hy1 < h) {
-        out[n++] = (XRectangle){ 0, hy1, (unsigned short)w, (unsigned short)(h - hy1) };
-    }
-    if (hx0 > 0) {
-        out[n++] = (XRectangle){ 0, hy0, (unsigned short)hx0, (unsigned short)hole[3] };
-    }
-    if (hx1 < w) {
-        out[n++] = (XRectangle){ hx1, hy0, (unsigned short)(w - hx1), (unsigned short)hole[3] };
-    }
-    return n;
+    return 1;
 }
 
 // An empty input shape is what makes the window transparent to the pointer: clicks, drags and
-// focus reach whatever is underneath.  Restoring a region needs the current size, because an
-// input shape does not follow the window geometry.
+// focus reach whatever is underneath.
 static void App_ApplyClickThrough(App *a)
 {
     if (!a->shape || !a->win) {
@@ -883,47 +852,27 @@ static void App_ApplyClickThrough(App *a)
     }
     if (g_params.ClickThrough) {
         XShape_SetEmptyInput(a->shape, a->dpy, a->win);
-        return;
+    } else {
+        XShape_SetFullInput(a->shape, a->dpy, a->win, a->width, a->height);
     }
-    // Otherwise the clickable region tracks what is painted, so the self-capture hole stays
-    // transparent to the pointer as well as to the eye.
-    XRectangle region[4];
-    const int count = App_WindowRegion(a, region);
-    XShape_SetInput(a->shape, a->dpy, a->win, region, count);
 }
 
-// Cuts the hole in the bounding shape.  This is the guarantee that makes the feature hold in
-// every mode: however the window ends up placed -- a WM ignoring the request, the user dragging
-// it, fullscreen or borderless where covering the rectangle is unavoidable -- it simply does
-// not paint over the sampled pixels, so the capture cannot contain its own output.  With
-// IgnoreSelf off the region is the whole window and the tunnel comes back, deliberately.
-static void App_ApplySelfShape(App *a)
-{
-    if (!a->shape || !a->win) {
-        return;
-    }
-    XRectangle region[4];
-    const int count = App_WindowRegion(a, region);
-    int hole[4];
-    App_SelfHole(a, hole);
-    Trace("self-shape: window %dx%d -> %d rect(s), hole %d,%d %dx%d", a->width, a->height, count,
-          hole[0], hole[1], hole[2], hole[3]);
-    XShape_SetBounding(a->shape, a->dpy, a->win, region, count);
-    if (!g_params.ClickThrough) {
-        XShape_SetInput(a->shape, a->dpy, a->win, region, count);
-    }
-    a->ignore_self_applied = g_params.IgnoreSelf;
-}
-
-// Insists on the placement App_WindowPlacement asked for, for the first moments after the
-// window appears.  After that the hole covers any overlap, so the user's own move wins.
+// Insists on the placement App_WindowPlacement asked for, but only until the window is clear of
+// the sampled rectangle or the deadline passes -- whichever comes first.  Past that it is never
+// argued with again: a window that is already clear, or that its owner has moved, is left alone.
 static void App_AssertPlacement(App *a)
 {
-    if (a->placement_frames <= 0) {
+    if (a->placement_state != 0) {
         return;
     }
-    --a->placement_frames;
-    if (a->mode != 0 || a->window_is_override_redirect || !g_params.IgnoreSelf) {
+
+    int cover[4];
+    if (!App_SourceCoverage(a, cover)) {
+        a->placement_state = 1; // clear of the rectangle, nothing to ask for
+        return;
+    }
+    if (a->mode != 0 || a->window_is_override_redirect || NowSeconds() > a->placement_until) {
+        a->placement_state = 2; // the mode owns its own geometry, or time is up
         return;
     }
 
@@ -940,7 +889,6 @@ static void App_AssertPlacement(App *a)
     if (rx != want_x || ry != want_y) {
         Trace("placement: asking for %d,%d (currently %d,%d)", want_x, want_y, rx, ry);
         XMoveWindow(a->dpy, a->win, want_x, want_y);
-        a->self_shape_dirty = 1;
         XFlush(a->dpy);
     }
 }
@@ -1005,9 +953,6 @@ static void App_ApplyWindowState(App *a)
         App_ApplyClickThrough(a);
         App_GrabHotkey(a, g_params.ClickThrough);
         a->click_through_applied = g_params.ClickThrough;
-    }
-    if (a->ignore_self_applied != g_params.IgnoreSelf) {
-        a->self_shape_dirty = 1;
     }
 }
 
@@ -1117,6 +1062,196 @@ static void App_UploadCleanRect(App *a, int x, int y, int width, int height, con
                     GL_UNSIGNED_BYTE, pixels);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
     glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+// Uploads the screen grab, minus the part of it this window covers, as up to four rectangles
+// around that footprint rather than whole.  What the screen grab holds inside the footprint is
+// this window's own output, and the pixels there are deliberately left alone: they keep the last
+// thing read there until App_GrabBeneath replaces them from the windows below.  Where nothing lies
+// beneath the viewer -- the desktop itself -- the last content read there stands, which for a
+// wallpaper is exactly right and is the one thing here that can go stale.
+static void App_UploadRootGrab(App *a, const CaptureRegion *region, const int skip[4])
+{
+    const int bpp = Capture_BitsPerPixel(a->capture);
+    if (bpp != 32 && bpp != 24) {
+        fprintf(stderr, "supercrt: unsupported root window depth (%d bpp)\n", bpp);
+        a->quit = 1;
+        return;
+    }
+    const unsigned char *data = Capture_Data(a->capture);
+    const int stride = Capture_PixelsPerLine(a->capture);
+    const int bytes = bpp / 8;
+
+    const int rx0 = region->offset_x;
+    const int ry0 = region->offset_y;
+    const int rx1 = rx0 + region->width;
+    const int ry1 = ry0 + region->height;
+
+    // Pieces to upload, in texture coordinates, clipped to what was actually grabbed.
+    int px[4][4];
+    int n = 0;
+    if (skip && skip[2] > 0 && skip[3] > 0) {
+        int sx0 = skip[0] < rx0 ? rx0 : skip[0];
+        int sy0 = skip[1] < ry0 ? ry0 : skip[1];
+        int sx1 = skip[0] + skip[2] > rx1 ? rx1 : skip[0] + skip[2];
+        int sy1 = skip[1] + skip[3] > ry1 ? ry1 : skip[1] + skip[3];
+        if (sx1 > sx0 && sy1 > sy0) {
+            const int p[4][4] = {
+                { rx0, ry0, rx1, sy0 }, // above the footprint
+                { rx0, sy1, rx1, ry1 }, // below it
+                { rx0, sy0, sx0, sy1 }, // left of it
+                { sx1, sy0, rx1, sy1 }, // right of it
+            };
+            for (int i = 0; i < 4; ++i) {
+                if (p[i][2] > p[i][0] && p[i][3] > p[i][1]) {
+                    for (int k = 0; k < 4; ++k) {
+                        px[n][k] = p[i][k];
+                    }
+                    ++n;
+                }
+            }
+        }
+    }
+    if (n == 0) {
+        for (int k = 0; k < 4; ++k) {
+            px[0][k] = (k == 0) ? rx0 : (k == 1) ? ry0 : (k == 2) ? rx1 : ry1;
+        }
+        n = 1;
+    }
+
+    for (int i = 0; i < n; ++i) {
+        const int x0 = px[i][0], y0 = px[i][1];
+        const int w = px[i][2] - x0, h = px[i][3] - y0;
+        const unsigned char *at = data + (size_t)(y0 - ry0) * (size_t)stride * (size_t)bytes +
+                                  (size_t)(x0 - rx0) * (size_t)bytes;
+        App_UploadCleanRect(a, x0, y0, w, h, at, stride, 1);
+    }
+}
+
+// The toplevel ancestor of `win` under the root: a client is usually reparented into a frame, and
+// skipping only the client would leave the frame -- holding the client's pixels -- in the stack.
+static Window App_ToplevelUnder(Display *dpy, Window root, Window win)
+{
+    Window cur = win;
+    for (int guard = 0; guard < 32; ++guard) {
+        Window r = None, parent = None, *kids = NULL;
+        unsigned int n = 0;
+        if (!XQueryTree(dpy, cur, &r, &parent, &kids, &n)) {
+            break;
+        }
+        if (kids) {
+            XFree(kids);
+        }
+        if (parent == None || parent == r || parent == root) {
+            break;
+        }
+        cur = parent;
+    }
+    return cur;
+}
+
+// Re-reads the covered footprint from the other windows in the stack, bottom to top: the last one
+// written is the topmost, which is what is on screen there once this window is discounted.  A
+// window below that is itself covered is corrected by whatever covers it in the same pass, so the
+// result is the screen's own answer rather than a guess.
+static void App_GrabBeneath(App *a, const int cover[4])
+{
+    Window root_ret = None, parent_ret = None;
+    Window *children = NULL;
+    unsigned int count = 0;
+    if (!XQueryTree(a->dpy, a->root, &root_ret, &parent_ret, &children, &count) || !children) {
+        return;
+    }
+
+    const Window mine = App_ToplevelUnder(a->dpy, a->root, a->win);
+    int pieces = 0;
+    for (unsigned int i = 0; i < count; ++i) {
+        const Window w = children[i];
+        if (w == mine) {
+            continue;
+        }
+        XWindowAttributes attrs;
+        if (!XGetWindowAttributes(a->dpy, w, &attrs)) {
+            continue;
+        }
+        if (attrs.map_state != IsViewable || attrs.class != InputOutput ||
+            attrs.depth != a->root_depth) {
+            continue;
+        }
+        const int x0 = cover[0] > attrs.x ? cover[0] : attrs.x;
+        const int y0 = cover[1] > attrs.y ? cover[1] : attrs.y;
+        const int x1 = (cover[0] + cover[2]) < (attrs.x + attrs.width) ? (cover[0] + cover[2])
+                                                                      : (attrs.x + attrs.width);
+        const int y1 = (cover[1] + cover[3]) < (attrs.y + attrs.height)
+                           ? (cover[1] + cover[3])
+                           : (attrs.y + attrs.height);
+        if (x1 <= x0 || y1 <= y0) {
+            continue;
+        }
+        CaptureRegion grabbed;
+        if (!Capture_GrabWindow(a->capture, w, x0 - attrs.x, y0 - attrs.y, x1 - x0, y1 - y0,
+                                &grabbed)) {
+            continue;
+        }
+        App_UploadCleanRect(a, x0 - g_params.SrcX, y0 - g_params.SrcY, grabbed.width,
+                            grabbed.height, Capture_Data(a->capture),
+                            Capture_PixelsPerLine(a->capture), 1);
+        ++pieces;
+    }
+
+    Trace("self-grab: cover %d,%d %dx%d from %d window(s)", cover[0], cover[1], cover[2], cover[3],
+          pieces);
+    XFree(children);
+}
+
+// Step 1 of the pipeline: the sampled rectangle as if this viewer were not on screen.
+static void App_GrabSource(App *a)
+{
+    CaptureRegion region;
+    if (!Capture_Grab(a->capture, g_params.SrcX, g_params.SrcY, g_params.SrcWidth,
+                      g_params.SrcHeight, &region)) {
+        return;
+    }
+
+    // Partly off screen: start from black, then blit what exists.
+    if (region.offset_x || region.offset_y || region.width != g_params.SrcWidth ||
+        region.height != g_params.SrcHeight) {
+        glBindFramebuffer(GL_FRAMEBUFFER, a->clear_fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, a->clean_tex, 0);
+        glViewport(0, 0, g_params.SrcWidth, g_params.SrcHeight);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+
+    int cover[4];
+    const int covered = App_SourceCoverage(a, cover);
+    int skip[4] = { 0, 0, 0, 0 };
+    if (covered) {
+        skip[0] = cover[0] - g_params.SrcX;
+        skip[1] = cover[1] - g_params.SrcY;
+        skip[2] = cover[2];
+        skip[3] = cover[3];
+    }
+    App_UploadRootGrab(a, &region, covered ? skip : NULL);
+    if (covered) {
+        // Nothing may be found under the viewer -- bare desktop -- and a footprint left untouched
+        // by both uploads keeps whatever the texture held, which on the first frames is
+        // uninitialised memory.  So the footprint is laid down as black and the windows below
+        // paint over it.  (A patch of desktop with no window under it therefore reads black
+        // rather than as wallpaper: a window's pixels cannot be asked for when they are not on
+        // screen, and the desktop's are only readable through one.)
+        glBindFramebuffer(GL_FRAMEBUFFER, a->clear_fbo);
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(skip[0], g_params.SrcHeight - (skip[1] + skip[3]), skip[2], skip[3]);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDisable(GL_SCISSOR_TEST);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        App_GrabBeneath(a, cover);
+    }
 }
 
 static int App_CreatePasses(App *a)
@@ -1549,7 +1684,6 @@ static void RunAction(App *a, ActionKind action)
         break;
     case ACTION_IGNORESELF:
         g_params.IgnoreSelf = !g_params.IgnoreSelf;
-        a->self_shape_dirty = 1;
         SetStatus(a, "ignore own output %s%s", g_params.IgnoreSelf ? "on" : "off",
                   g_params.IgnoreSelf ? "" : " (the window samples itself again)");
         a->dirty_settings = 1;
@@ -2235,11 +2369,8 @@ static void HandleEvents(App *a)
 
         switch (ev.type) {
         case ConfigureNotify:
-            // Both shapes are regions in window coordinates, and a *move* leaves them over the
-            // wrong pixels just as much as a resize does: the hole is positioned relative to
-            // the sampled rectangle, which does not move with the window.  So both are
-            // invalidated for either, whether or not the drawable size changed.
-            a->self_shape_dirty = 1;
+            // The input shape is a region in window coordinates, so any change in geometry
+            // invalidates it; the coverage the grab works from is measured fresh each frame.
             a->click_through_applied = -1;
             if (ev.xconfigure.width != a->width || ev.xconfigure.height != a->height) {
                 a->width = ev.xconfigure.width > 0 ? ev.xconfigure.width : 1;
@@ -2327,8 +2458,9 @@ static void Usage(const char *argv0)
         "action, c/t/b set the capture region from the mouse, e drag target area, s save,\n"
         "l reload, r defaults, m outline, f window mode, a always-on-top, k click-through,\n"
         "i ignore own output, v vsync, q quit.\n"
-        "The viewer never samples its own output: it keeps clear of the sampled rectangle and\n"
-        "punches a hole in itself wherever it would overlap, so no recursion and no feedback.\n"
+        "The viewer never samples its own output: wherever it covers the sampled rectangle it\n"
+        "reads those pixels from the windows underneath instead, so no recursion, no feedback,\n"
+        "and no gap in the picture.\n"
         "Click-through makes the window ignore the pointer, so windows behind it can be driven\n"
         "while the viewer stays up.  Ctrl+Alt+C releases it from anywhere, k releases it when\n"
         "the window has the keyboard.\n",
@@ -2515,6 +2647,7 @@ int main(int argc, char **argv)
     app.net_wm_state = XInternAtom(app.dpy, "_NET_WM_STATE", False);
     app.net_wm_state_fullscreen = XInternAtom(app.dpy, "_NET_WM_STATE_FULLSCREEN", False);
     app.net_wm_state_above = XInternAtom(app.dpy, "_NET_WM_STATE_ABOVE", False);
+    app.root_depth = DefaultDepth(app.dpy, app.screen);
     app.shape = XShape_Open();
     if (!XShape_Supported(app.shape)) {
         fprintf(stderr, "supercrt: libXext/XShape unavailable; click-through disabled\n");
@@ -2646,35 +2779,7 @@ int main(int argc, char **argv)
             App_UploadCleanRect(&app, 0, 0, g_params.SrcWidth, g_params.SrcHeight, app.pattern,
                                 g_params.SrcWidth, 0);
         } else {
-            CaptureRegion region;
-            if (Capture_Grab(app.capture, g_params.SrcX, g_params.SrcY, g_params.SrcWidth,
-                             g_params.SrcHeight, &region)) {
-                const int bpp = Capture_BitsPerPixel(app.capture);
-                if ((region.offset_x || region.offset_y || region.width != g_params.SrcWidth ||
-                     region.height != g_params.SrcHeight)) {
-                    // Partially off screen: start from black, then blit what exists.
-                    glBindFramebuffer(GL_FRAMEBUFFER, app.clear_fbo);
-                    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
-                                           app.clean_tex, 0);
-                    glViewport(0, 0, g_params.SrcWidth, g_params.SrcHeight);
-                    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-                    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-                    glClear(GL_COLOR_BUFFER_BIT);
-                    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-                }
-                if (bpp == 32) {
-                    App_UploadCleanRect(&app, region.offset_x, region.offset_y, region.width,
-                                        region.height, Capture_Data(app.capture),
-                                        Capture_PixelsPerLine(app.capture), 1);
-                } else if (bpp == 24) {
-                    App_UploadCleanRect(&app, region.offset_x, region.offset_y, region.width,
-                                        region.height, Capture_Data(app.capture),
-                                        Capture_PixelsPerLine(app.capture), 1);
-                } else {
-                    fprintf(stderr, "supercrt: unsupported root window depth (%d bpp)\n", bpp);
-                    app.quit = 1;
-                }
-            }
+            App_GrabSource(&app);
         }
 
         // 2-6. CRT pipeline
@@ -2744,18 +2849,11 @@ int main(int argc, char **argv)
                   g_params.SrcHeight);
             Marker_SetRect(app.marker, g_params.SrcX, g_params.SrcY, g_params.SrcWidth, g_params.SrcHeight);
             RegionRemember(last_region, &g_params);
-            app.self_shape_dirty = 1; // the hole follows the sampled rectangle
         }
         // Always-on-top and click-through, pushed only when the value changed.
         App_ApplyWindowState(&app);
-        // Placement is asked for repeatedly for the first moment, then left alone.
+        // Placement is asked for for the first moment, then left alone.
         App_AssertPlacement(&app);
-        // The self-capture hole is re-cut only when the geometry or the sampled rectangle
-        // moved, since both are round trips to the server.
-        if (app.self_shape_dirty) {
-            App_ApplySelfShape(&app);
-            app.self_shape_dirty = 0;
-        }
         // Borderless mode has no window manager to honour _NET_WM_STATE_ABOVE, so it keeps
         // itself in front directly.  Every other mode leaves it to the WM, which is what
         // lets a window behind be focused and driven without the viewer dropping behind.
