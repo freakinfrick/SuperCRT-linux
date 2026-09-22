@@ -2423,6 +2423,23 @@ static void App_SyncSourceSize(App *a)
     }
     App_CreateCleanTexture(a);
     App_CreateTargets(a);
+
+    // The --pattern buffer is refilled at the current source size every frame, so it has to
+    // grow with it: it was allocated once, for the dimensions the app started with, and any
+    // capture-size change used to make the refill write past the end of that allocation
+    // (heap corruption, first seen as an abort inside the GL driver).  Reachable from the
+    // size rows, the target-area drag, a config reload and "set capture bottom-right".
+    if (a->pattern) {
+        unsigned char *grown =
+            malloc((size_t)g_params.SrcWidth * (size_t)g_params.SrcHeight * 4);
+        if (!grown) {
+            a->quit = 1;   // no pattern buffer means no source image; better than writing past it
+            return;
+        }
+        free(a->pattern);
+        a->pattern = grown;
+    }
+
     a->src_alloc_w = g_params.SrcWidth;
     a->src_alloc_h = g_params.SrcHeight;
 }
