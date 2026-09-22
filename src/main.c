@@ -542,36 +542,91 @@ static void App_ApplySwapInterval(App *a, int interval)
     }
 }
 
-static void App_CreateWindow(App *a, int override_redirect, int width, int height)
+// Picks a size and position for the windowed sim.  The one thing this must not do is cover
+// the rectangle being sampled: that would feed the sim back into itself.  Preference order is
+// beside the rectangle, then below it, then shrunk to fit beside it, then the far corner.
+static void App_WindowPlacement(App *a, int *width, int *height, int *x, int *y)
 {
-    // Windowed placement mirrors the reference, which puts its destination window to the
-    // right of the source region: overlapping the sampled rectangle would feed the sim
-    // back into itself.
-    int x = 0, y = 0;
-    if (!override_redirect) {
-        if (g_params.SrcX + g_params.SrcWidth + 64 + width <= a->screen_width) {
-            x = g_params.SrcX + g_params.SrcWidth + 64;
-            y = g_params.SrcY;
-        } else if (g_params.SrcY + g_params.SrcHeight + 64 + height <= a->screen_height) {
-            x = g_params.SrcX;
-            y = g_params.SrcY + g_params.SrcHeight + 64;
+    const int gap = 16;
+    const int margin = 32;
+    int w = *width;
+    int h = *height;
+    *x = 0;
+    *y = 0;
+
+    const int right_x = g_params.SrcX + g_params.SrcWidth + gap;
+    const int right_room = a->screen_width - right_x;
+    const int below_y = g_params.SrcY + g_params.SrcHeight + gap;
+    const int below_room = a->screen_height - below_y;
+
+    const int fits_right = w <= right_room && h <= a->screen_height - g_params.SrcY;
+    const int fits_below = w <= a->screen_width && h <= below_room;
+    if (fits_right || fits_below) {
+        if (fits_right) {
+            *x = right_x;
+            *y = g_params.SrcY;
         } else {
-            // No room beside the region on this screen; tuck the window into the far
-            // corner rather than on top of the pixels it is sampling.
-            x = a->screen_width - width - 32;
-            y = a->screen_height - height - 32;
-            if (x < 0) {
-                x = 0;
-            }
-            if (y < 0) {
-                y = 0;
-            }
+            *y = below_y;
+        }
+        return;
+    }
+
+    // Same aspect ratio, largest size that still clears the rectangle.
+    const float aspect = (float)w / (float)(h > 0 ? h : 1);
+    int best_w = 0, best_h = 0, best_x = 0, best_y = 0;
+    if (right_room >= 320) {
+        int cw = right_room;
+        int ch = (int)((float)cw / aspect);
+        if (ch > a->screen_height - g_params.SrcY) {
+            ch = a->screen_height - g_params.SrcY;
+            cw = (int)((float)ch * aspect);
+        }
+        best_w = cw;
+        best_h = ch;
+        best_x = right_x;
+        best_y = g_params.SrcY;
+    }
+    if (below_room >= 180) {
+        int ch = below_room;
+        int cw = (int)((float)ch * aspect);
+        if (cw > a->screen_width) {
+            cw = a->screen_width;
+            ch = (int)((float)cw / aspect);
+        }
+        if (cw > best_w) {
+            best_w = cw;
+            best_h = ch;
+            best_x = 0;
+            best_y = below_y;
         }
     }
-    if (a->win) {
-        glXMakeCurrent(a->dpy, None, NULL);
-        XDestroyWindow(a->dpy, a->win);
-        a->win = 0;
+    if (best_w >= 320 && best_h >= 180) {
+        fprintf(stderr, "supercrt: window fitted to %dx%d so it does not cover the target area\n",
+                best_w, best_h);
+        *width = best_w;
+        *height = best_h;
+        *x = best_x;
+        *y = best_y;
+        return;
+    }
+
+    // The rectangle leaves no usable space; take the far corner.
+    *x = a->screen_width - w - margin;
+    *y = a->screen_height - h - margin;
+    if (*x < 0) {
+        *x = 0;
+    }
+    if (*y < 0) {
+        *y = 0;
+    }
+}
+
+static void App_CreateWindow(App *a, int override_redirect, int width, int height)
+{
+    int x = 0;
+    int y = 0;
+    if (!override_redirect) {
+        App_WindowPlacement(a, &width, &height, &x, &y);
     }
 
     XSetWindowAttributes attrs;
