@@ -208,6 +208,8 @@ typedef struct {
     int window_is_override_redirect;
     int screen_width, screen_height;
     int using_shm;
+    int swap_control;   // driver-honoured vsync; 0 means pace frames in software
+    int fast_frames;    // consecutive frames that finished far too fast to be vsynced
     int quit;
 
     // GL objects
@@ -522,24 +524,43 @@ static int WritePPM(const char *path, int width, int height, const unsigned char
 // Window / GLX
 // ---------------------------------------------------------------------------
 
+// Wall-clock seconds; clock() would measure CPU time and pace frames wrongly.
+static double NowSeconds(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
 typedef void (*PFNSwapIntervalEXT)(Display *, GLXDrawable, int);
 typedef int (*PFNSwapIntervalMESA)(unsigned);
 typedef int (*PFNSwapIntervalSGI)(int);
 
-static void App_ApplySwapInterval(App *a, int interval)
+// Returns 1 when the driver honoured a swap interval, 0 when nothing was available and the
+// caller must pace frames itself (xorgxrdp and other remote X servers have no swap control,
+// and without pacing the sim spins a core at full speed).
+static int App_ApplySwapInterval(App *a, int interval)
 {
     PFNSwapIntervalEXT ext = (PFNSwapIntervalEXT)glXGetProcAddressARB((const GLubyte *)"glXSwapIntervalEXT");
     PFNSwapIntervalMESA mesa = (PFNSwapIntervalMESA)glXGetProcAddressARB((const GLubyte *)"glXSwapIntervalMESA");
     PFNSwapIntervalSGI sgi = (PFNSwapIntervalSGI)glXGetProcAddressARB((const GLubyte *)"glXSwapIntervalSGI");
     if (ext) {
         ext(a->dpy, a->win, interval);
-    } else if (mesa) {
-        mesa((unsigned)interval);
-    } else if (sgi) {
-        sgi(interval);
-    } else {
-        fprintf(stderr, "supercrt: no swap-control extension; frames are not vsynced\n");
+        return 1;
     }
+    if (mesa) {
+        mesa((unsigned)interval);
+        return 1;
+    }
+    if (sgi) {
+        sgi(interval);
+        return 1;
+    }
+    if (interval > 0) {
+        fprintf(stderr, "supercrt: no swap-control extension on this display; "
+                        "pacing frames in software instead\n");
+    }
+    return 0;
 }
 
 // Picks a size and position for the windowed sim.  The one thing this must not do is cover
@@ -654,7 +675,7 @@ static void App_CreateWindow(App *a, int override_redirect, int width, int heigh
         fprintf(stderr, "supercrt: glXMakeCurrent failed on the new window\n");
         exit(1);
     }
-    App_ApplySwapInterval(a, g_params.VSync ? 1 : 0);
+    a->swap_control = App_ApplySwapInterval(a, g_params.VSync ? 1 : 0);
 }
 
 static void App_SetMode(App *a, int mode)
@@ -1204,8 +1225,9 @@ static void RunAction(App *a, ActionKind action)
         break;
     case ACTION_VSYNC:
         g_params.VSync = !g_params.VSync;
-        App_ApplySwapInterval(a, g_params.VSync ? 1 : 0);
-        SetStatus(a, "vsync %s", g_params.VSync ? "on" : "off");
+        a->swap_control = App_ApplySwapInterval(a, g_params.VSync ? 1 : 0);
+        SetStatus(a, "vsync %s%s", g_params.VSync ? "on" : "off",
+                  a->swap_control ? "" : " (software-paced)");
         a->dirty_settings = 1;
         break;
     case ACTION_SAVE:
@@ -1218,7 +1240,7 @@ static void RunAction(App *a, ActionKind action)
         break;
     case ACTION_RELOAD:
         Params_Load(&g_params, a->config_path);
-        App_ApplySwapInterval(a, g_params.VSync ? 1 : 0);
+        a->swap_control = App_ApplySwapInterval(a, g_params.VSync ? 1 : 0);
         SetStatus(a, "reloaded %s", a->config_path);
         break;
     case ACTION_DEFAULTS:
@@ -1922,7 +1944,7 @@ static void Usage(const char *argv0)
         "  --fullscreen         start fullscreen via the window manager\n"
         "  --borderless         start as a borderless window covering the screen\n"
         "  --no-outline         hide the capture-region outline\n"
-        "  --no-vsync           disable vsync\n"
+        "  --no-vsync           pace frames in software instead of waiting for vblank\n"
         "  --no-shm             force the XGetImage capture path (no MIT-SHM)\n"
         "  --pattern            use a built-in test pattern instead of the desktop\n"
         "  --frame-out FILE     write one frame to FILE as binary PPM and exit\n"
@@ -2142,7 +2164,7 @@ int main(int argc, char **argv)
         app.mode = 0;
         App_SetMode(&app, mode);
     } else {
-        App_ApplySwapInterval(&app, g_params.VSync ? 1 : 0);
+        app.swap_control = App_ApplySwapInterval(&app, g_params.VSync ? 1 : 0);
     }
 
     // --- assets ---
@@ -2228,7 +2250,7 @@ int main(int argc, char **argv)
            app.width, app.height, app.using_shm ? "MIT-SHM" : "XGetImage");
 
     // --- main loop ---
-    double fps_start = (double)clock() / CLOCKS_PER_SEC;
+    double fps_start = NowSeconds();
     double last_frame_time = fps_start;
     int frame_out_written = 0;
 
@@ -2357,26 +2379,41 @@ int main(int argc, char **argv)
             --app.status_frames;
         }
 
-        // Frame pacing when vsync is unavailable (or forced off).
-        const double now = (double)clock() / CLOCKS_PER_SEC;
-        if (!g_params.VSync) {
+        // Frame pacing: the swap does it when the driver took a swap interval, otherwise
+        // sleep out the remainder of the 60Hz period here.
+        const double now = NowSeconds();
+
+        // A swap interval that is accepted but never throttles (remote X servers, some
+        // drivers) would leave the sim spinning a core at full speed.  Detect it from the
+        // frame period and pace in software instead, once.
+        if (g_params.VSync && app.swap_control) {
+            app.fast_frames = (now - last_frame_time) < 0.008 ? app.fast_frames + 1 : 0;
+            if (app.fast_frames > 60) {
+                fprintf(stderr, "supercrt: swap interval is not throttling this display; "
+                                "pacing frames in software instead\n");
+                app.swap_control = 0;
+            }
+        }
+
+        if (!g_params.VSync || !app.swap_control) {
             const double target = 1.0 / 60.0;
-            double elapsed = now - last_frame_time;
+            const double elapsed = now - last_frame_time;
             if (elapsed < target) {
                 struct timespec ts;
-                double sleep_s = target - elapsed;
+                const double sleep_s = target - elapsed;
                 ts.tv_sec = (time_t)sleep_s;
                 ts.tv_nsec = (long)((sleep_s - (double)ts.tv_sec) * 1e9);
                 nanosleep(&ts, NULL);
             }
         }
-        last_frame_time = (double)clock() / CLOCKS_PER_SEC;
+        last_frame_time = NowSeconds();
 
         app.fps_frames++;
         if (now - fps_start >= 1.0) {
             app.fps = (double)app.fps_frames / (now - fps_start);
             app.fps_frames = 0;
             fps_start = now;
+            Trace("fps %.1f", app.fps);
         }
     }
 
