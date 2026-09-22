@@ -6,7 +6,7 @@ CFLAGS  += -std=c99 -Wall -Wextra -Wno-unused-parameter -D_DEFAULT_SOURCE
 LDLIBS  := -lX11 -lGL -ldl -lm
 
 SRC := src/main.c src/capture.c src/marker.c src/assets.c src/params.c src/ui.c \
-       src/shader.c src/gl_api.c
+       src/shader.c src/gl_api.c src/xshape.c
 OBJ := $(SRC:.c=.o)
 
 PREFIX ?= /usr/local

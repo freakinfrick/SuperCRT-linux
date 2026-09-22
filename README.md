@@ -41,6 +41,8 @@ If you find this effect useful, the credit belongs upstream.
 - **Live settings overlay** written from scratch: an on-screen config menu you can click
   or drive from the keyboard, plus drag-to-place sampling-rectangle targeting. Upstream
   leaves tuning to its source constants and config.
+- **Always-on-top and click-through**, so the viewer can sit over the desktop while windows
+  behind it are driven — see below.
 - **INI config** (`supercrt.ini`) with field names mapped 1:1 onto upstream's
   `Parameters.h` statics, so the port can be diffed against the original by eye. Defaults
   are the upstream values.
@@ -92,7 +94,9 @@ Assets are searched for as `assets/*` beside the binary, then `../assets`,
   **Home/End** min/max, **Enter** run the selected action, and —
   `c` centre the capture on the cursor, `t` / `b` anchor the capture's top-left /
   bottom-right at the cursor, `e` drag target, `m` outline, `f` window mode,
-  `a` always-on-top, `v` vsync, `s` save, `l` reload, `r` defaults, `q` quit.
+  `a` always-on-top, `k` click-through, `v` vsync, `s` save, `l` reload, `r` defaults,
+  `q` quit. These all need the overlay open, which is why click-through also has a
+  global chord: **Ctrl+Alt+C**.
 
 ### Configuration
 
@@ -100,6 +104,34 @@ Assets are searched for as `assets/*` beside the binary, then `../assets`,
 **s** in the overlay. The `[CRT]` section is the upstream tunable set (screen-mesh
 curvature, scanline and mask strength, persistence, bleed, NTSC artifact amount, bloom,
 blur radii, gamma, FOV, …). Delete the file or press **r** to return to upstream defaults.
+
+## Working in the windows behind the viewer
+
+Two `[Window]` settings let the viewer sit over your desktop instead of competing with it.
+Both default to **off**.
+
+```ini
+[Window]
+AlwaysOnTop=true     ; the viewer cannot be covered by other windows
+ClickThrough=true    ; the pointer passes through the viewer
+```
+
+**`AlwaysOnTop`** asks the window manager to keep the viewer above other windows, so
+clicking a window underneath raises it *below* the viewer rather than over it. This needs
+an EWMH window manager; with none running (the borderless fallback) the viewer keeps itself
+in front by re-raising periodically instead.
+
+**`ClickThrough`** becomes the only thing under the pointer that ignores it: clicks, drags
+and focus land on whatever is behind, so the desktop can be driven normally with the CRT
+view still up. The bottom strip stays visible in this state to say so, with the two mouse
+buttons replaced by that notice — they cannot be clicked, so they are not offered.
+
+The consequence to know about is that the viewer's own mouse UI is unreachable while it is
+on. Leave it with **Ctrl+Alt+C**, a passive grab on the root window that fires no matter
+which window has the keyboard, or by focusing the viewer and pressing **k** in the overlay.
+If another client already holds Ctrl+Alt+C the grab fails with a note on stderr; raise the
+viewer and press **k** instead. The viewer is normally also reachable through the window
+manager's own switcher (**Alt-Tab**), which does not go through the pointer.
 
 ## Pipeline
 
@@ -122,6 +154,7 @@ Six passes, matching the reference `Render()`:
 | `src/params.c`, `src/params.h` | Tunables, INI load/save, defaults |
 | `src/ui.c` | Settings overlay, sliders, bottom bar |
 | `src/marker.c` | Capture-region outline overlay (XShape) |
+| `src/xshape.c` | XShape access for the outline and click-through (libXext, `dlopen`ed) |
 | `src/gl_api.c` | Runtime GL entry-point resolution |
 | `src/font_atlas.h` | Embedded overlay font, baked by `tools/bake_font.py` |
 

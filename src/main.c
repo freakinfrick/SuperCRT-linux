@@ -33,6 +33,7 @@
 #include "shader.h"
 #include "shaders.h"
 #include "ui.h"
+#include "xshape.h"
 
 #define DEG2RAD 0.017453292519943295f
 #define DEFAULT_FOV_DEGREES 15.0f
@@ -201,6 +202,7 @@ typedef struct {
     Atom wm_delete_window;
     Atom net_wm_state;
     Atom net_wm_state_fullscreen;
+    Atom net_wm_state_above;
 
     int width, height;      // current drawable size (== Dst dims)
     int windowed_width, windowed_height;
@@ -230,6 +232,7 @@ typedef struct {
     // Per-frame scratch
     Capture *capture;
     Marker *marker;
+    XShapeApi *shape;
     UI ui;
     unsigned char *pattern;
     int frame_index;
@@ -237,6 +240,9 @@ typedef struct {
     int overlay_open;
     int overlay_selected;
     int capture_outline_enabled;
+    int on_top_applied;          // last value pushed to the WM, -1 to force a re-apply
+    int click_through_applied;   // likewise for the input shape
+    int hotkey_grabbed;
     double last_fps_time;
     int fps_frames;
     double fps;
@@ -676,6 +682,120 @@ static void App_CreateWindow(App *a, int override_redirect, int width, int heigh
         exit(1);
     }
     a->swap_control = App_ApplySwapInterval(a, g_params.VSync ? 1 : 0);
+
+    // WM state and input shapes belong to the window that was just thrown away.
+    a->on_top_applied = -1;
+    a->click_through_applied = -1;
+}
+
+// ---------------------------------------------------------------------------
+// Window-manager state: always-on-top and click-through
+// ---------------------------------------------------------------------------
+
+// Fullscreen and "above" are the same EWMH client message with a different atom.  With no
+// window manager listening there is nothing to honour it, which is why the borderless path
+// also keeps itself on top with a periodic raise (see the frame loop).
+static void App_SendWmState(App *a, int add, Atom state)
+{
+    if (!a->win || !a->net_wm_state || !state) {
+        return;
+    }
+    XEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.xclient.type = ClientMessage;
+    ev.xclient.window = a->win;
+    ev.xclient.message_type = a->net_wm_state;
+    ev.xclient.format = 32;
+    ev.xclient.data.l[0] = add ? 1 : 0; // _NET_WM_STATE_ADD / _NET_WM_STATE_REMOVE
+    ev.xclient.data.l[1] = (long)state;
+    XSendEvent(a->dpy, a->root, False, SubstructureRedirectMask | SubstructureNotifyMask, &ev);
+    XFlush(a->dpy);
+}
+
+static void App_SetOnTop(App *a, int on)
+{
+    App_SendWmState(a, on, a->net_wm_state_above);
+    if (on && a->mode == 2) {
+        XRaiseWindow(a->dpy, a->win);
+    }
+}
+
+// An empty input shape is what makes the window transparent to the pointer: clicks, drags
+// and focus reach whatever is underneath.  Restoring a region needs the current size,
+// because an input shape does not follow the window geometry.
+static void App_ApplyClickThrough(App *a)
+{
+    if (!a->shape || !a->win) {
+        return;
+    }
+    if (g_params.ClickThrough) {
+        XShape_SetEmptyInput(a->shape, a->dpy, a->win);
+    } else {
+        XShape_SetFullInput(a->shape, a->dpy, a->win, a->width, a->height);
+    }
+}
+
+#define HOTKEY_MODS (ControlMask | Mod1Mask) // Ctrl+Alt+C
+
+static volatile int g_grab_error;
+
+static int App_IgnoreXError(Display *dpy, XErrorEvent *ev)
+{
+    (void)dpy;
+    (void)ev;
+    g_grab_error = 1;
+    return 0;
+}
+
+// Click-through is most useful while some *other* window holds the keyboard, and it leaves
+// the pointer unable to reach the sim window at all, so the way out has to be a passive grab
+// on the root window: that fires no matter who is focused.  Caps Lock and Num Lock each add
+// a modifier bit, so the chord is grabbed in the four combinations a WM may report for it.
+// The grab exists only while click-through is on.
+static void App_GrabHotkey(App *a, int grab)
+{
+    if (grab == a->hotkey_grabbed) {
+        return;
+    }
+    const KeyCode code = XKeysymToKeycode(a->dpy, XK_c);
+    if (!code) {
+        return;
+    }
+
+    // A combination another client already holds raises BadAccess, which the default handler
+    // turns into a process exit; a hotkey that cannot be installed must not do that.
+    static const unsigned extra[4] = { 0, LockMask, Mod2Mask, LockMask | Mod2Mask };
+    int (*previous)(Display *, XErrorEvent *) = XSetErrorHandler(App_IgnoreXError);
+    for (int i = 0; i < 4; ++i) {
+        if (grab) {
+            XGrabKey(a->dpy, code, HOTKEY_MODS | extra[i], a->root, False, GrabModeAsync,
+                     GrabModeAsync);
+        } else {
+            XUngrabKey(a->dpy, code, HOTKEY_MODS | extra[i], a->root);
+        }
+    }
+    XSync(a->dpy, False);
+    XSetErrorHandler(previous);
+    a->hotkey_grabbed = grab;
+    if (grab && g_grab_error) {
+        fprintf(stderr, "supercrt: Ctrl+Alt+C is held by another client; click-through can "
+                        "still be released by raising this window and pressing k\n");
+    }
+}
+
+// Both flags can change from the overlay, a key, or a reloaded config, and both are lost
+// with the window, so they are pushed whenever the value differs from what is in force.
+static void App_ApplyWindowState(App *a)
+{
+    if (a->on_top_applied != g_params.AlwaysOnTop) {
+        App_SetOnTop(a, g_params.AlwaysOnTop);
+        a->on_top_applied = g_params.AlwaysOnTop;
+    }
+    if (a->click_through_applied != g_params.ClickThrough) {
+        App_ApplyClickThrough(a);
+        App_GrabHotkey(a, g_params.ClickThrough);
+        a->click_through_applied = g_params.ClickThrough;
+    }
 }
 
 static void App_SetMode(App *a, int mode)
@@ -700,30 +820,12 @@ static void App_SetMode(App *a, int mode)
         } else {
             XResizeWindow(a->dpy, a->win, (unsigned)a->windowed_width, (unsigned)a->windowed_height);
         }
-        if (a->net_wm_state) {
-            XEvent ev;
-            memset(&ev, 0, sizeof(ev));
-            ev.xclient.type = ClientMessage;
-            ev.xclient.window = a->win;
-            ev.xclient.message_type = a->net_wm_state;
-            ev.xclient.format = 32;
-            ev.xclient.data.l[0] = 0; // _NET_WM_STATE_REMOVE
-            ev.xclient.data.l[1] = (long)a->net_wm_state_fullscreen;
-            XSendEvent(a->dpy, a->root, False, SubstructureRedirectMask | SubstructureNotifyMask, &ev);
-        }
+        App_SendWmState(a, 0, a->net_wm_state_fullscreen);
     } else if (mode == 1) {
         if (a->window_is_override_redirect) {
             App_CreateWindow(a, 0, a->windowed_width, a->windowed_height);
         }
-        XEvent ev;
-        memset(&ev, 0, sizeof(ev));
-        ev.xclient.type = ClientMessage;
-        ev.xclient.window = a->win;
-        ev.xclient.message_type = a->net_wm_state;
-        ev.xclient.format = 32;
-        ev.xclient.data.l[0] = 1; // _NET_WM_STATE_ADD
-        ev.xclient.data.l[1] = (long)a->net_wm_state_fullscreen;
-        XSendEvent(a->dpy, a->root, False, SubstructureRedirectMask | SubstructureNotifyMask, &ev);
+        App_SendWmState(a, 1, a->net_wm_state_fullscreen);
     } else {
         // Borderless: unmanaged window covering the whole screen.
         App_CreateWindow(a, 1, a->screen_width, a->screen_height);
@@ -1130,6 +1232,7 @@ typedef enum {
     ACTION_OUTLINE,
     ACTION_FULLSCREEN,
     ACTION_ONTOP,
+    ACTION_CLICKTHROUGH,
     ACTION_VSYNC,
     ACTION_SAVE,
     ACTION_RELOAD,
@@ -1151,6 +1254,7 @@ static const OverlayAction kActions[] = {
     { "Toggle capture outline",       ACTION_OUTLINE,       "m" },
     { "Cycle window mode",            ACTION_FULLSCREEN,    "f" },
     { "Toggle always on top",         ACTION_ONTOP,         "a" },
+    { "Toggle click-through",         ACTION_CLICKTHROUGH,  "k" },
     { "Toggle vsync",                 ACTION_VSYNC,         "v" },
     { "Save settings",                ACTION_SAVE,          "s" },
     { "Reload settings from disk",    ACTION_RELOAD,        "l" },
@@ -1221,6 +1325,11 @@ static void RunAction(App *a, ActionKind action)
     case ACTION_ONTOP:
         g_params.AlwaysOnTop = !g_params.AlwaysOnTop;
         SetStatus(a, "always on top %s", g_params.AlwaysOnTop ? "on" : "off");
+        a->dirty_settings = 1;
+        break;
+    case ACTION_CLICKTHROUGH:
+        g_params.ClickThrough = !g_params.ClickThrough;
+        SetStatus(a, "click-through %s", g_params.ClickThrough ? "on" : "off");
         a->dirty_settings = 1;
         break;
     case ACTION_VSYNC:
@@ -1375,13 +1484,16 @@ static void Overlay_Draw(App *a)
 }
 
 // Bottom strip, shown while the pointer is over the sim window: makes the two things a
-// mouse-only session needs (the settings panel and the target-area drag) discoverable.
+// mouse-only session needs (the settings panel and the target-area drag) discoverable.  It
+// also reports the window flags, so it stays up while click-through is on: the pointer
+// cannot reach the window to summon it, and the two buttons are unreachable then, so state
+// text takes their place.
 static void Hud_Draw(App *a)
 {
     UI *ui = &a->ui;
     a->hud_settings = (Rectf){ 0, 0, 0, 0 };
     a->hud_target = (Rectf){ 0, 0, 0, 0 };
-    if (a->overlay_open || (!a->pointer_inside && !a->edit_mode)) {
+    if (a->overlay_open || (!a->pointer_inside && !a->edit_mode && !g_params.ClickThrough)) {
         return;
     }
 
@@ -1400,20 +1512,28 @@ static void Hud_Draw(App *a)
         return;
     }
 
-    a->hud_settings = (Rectf){ x - 6.0f, y + 3.0f, 150.0f, bar_h - 6.0f };
-    UI_Rect(ui, a->hud_settings.x, a->hud_settings.y, a->hud_settings.w, a->hud_settings.h,
-            0.16f, 0.34f, 0.60f, 0.80f);
-    UI_Text(ui, x, text_y, 0.95f, 0.95f, 1.0f, 1.0f, "Settings (Esc)");
-    x += 162.0f;
+    if (g_params.ClickThrough) {
+        static const char *const label =
+            "click-through ON - the pointer passes through this window: Ctrl+Alt+C brings it back";
+        UI_Text(ui, x, text_y, 1.0f, 0.72f, 0.30f, 1.0f, label);
+        x += UI_TextWidth(label) + 24.0f;
+    } else {
+        a->hud_settings = (Rectf){ x - 6.0f, y + 3.0f, 150.0f, bar_h - 6.0f };
+        UI_Rect(ui, a->hud_settings.x, a->hud_settings.y, a->hud_settings.w, a->hud_settings.h,
+                0.16f, 0.34f, 0.60f, 0.80f);
+        UI_Text(ui, x, text_y, 0.95f, 0.95f, 1.0f, 1.0f, "Settings (Esc)");
+        x += 162.0f;
 
-    a->hud_target = (Rectf){ x - 6.0f, y + 3.0f, 216.0f, bar_h - 6.0f };
-    UI_Rect(ui, a->hud_target.x, a->hud_target.y, a->hud_target.w, a->hud_target.h,
-            0.16f, 0.34f, 0.60f, 0.80f);
-    UI_Text(ui, x, text_y, 0.95f, 0.95f, 1.0f, 1.0f, "Adjust target area (E)");
-    x += 228.0f;
+        a->hud_target = (Rectf){ x - 6.0f, y + 3.0f, 216.0f, bar_h - 6.0f };
+        UI_Rect(ui, a->hud_target.x, a->hud_target.y, a->hud_target.w, a->hud_target.h,
+                0.16f, 0.34f, 0.60f, 0.80f);
+        UI_Text(ui, x, text_y, 0.95f, 0.95f, 1.0f, 1.0f, "Adjust target area (E)");
+        x += 228.0f;
+    }
 
-    UI_TextF(ui, x, text_y, 0.70f, 0.76f, 0.82f, 1.0f, "target %d,%d %dx%d   %.0f fps%s",
+    UI_TextF(ui, x, text_y, 0.70f, 0.76f, 0.82f, 1.0f, "target %d,%d %dx%d   %.0f fps%s%s",
              g_params.SrcX, g_params.SrcY, g_params.SrcWidth, g_params.SrcHeight, a->fps,
+             g_params.AlwaysOnTop ? "   on top" : "",
              a->dirty_settings ? "   (unsaved)" : "");
 }
 
@@ -1867,6 +1987,7 @@ static int HandleKey(App *a, XKeyEvent *key)
     case XK_b: RunAction(a, ACTION_BOTTOM_RIGHT); return 1;
     case XK_m: RunAction(a, ACTION_OUTLINE); return 1;
     case XK_a: RunAction(a, ACTION_ONTOP); return 1;
+    case XK_k: RunAction(a, ACTION_CLICKTHROUGH); return 1;
     case XK_v: RunAction(a, ACTION_VSYNC); return 1;
     case XK_s: RunAction(a, ACTION_SAVE); return 1;
     case XK_l: RunAction(a, ACTION_RELOAD); return 1;
@@ -1890,12 +2011,21 @@ static void HandleEvents(App *a)
                     a->windowed_height = a->height;
                 }
                 App_CreateTargets(a);
+                // The input shape is a region in window coordinates, so a resize leaves it
+                // covering the wrong area: force the next apply.
+                a->click_through_applied = -1;
             }
             break;
         case Expose:
             Marker_Redraw(a->marker);
             break;
         case KeyPress:
+            // Keys delivered on the root window can only be the click-through release chord;
+            // the sim window's own keys arrive on the sim window.
+            if (a->hotkey_grabbed && ev.xkey.window == a->root) {
+                RunAction(a, ACTION_CLICKTHROUGH);
+                break;
+            }
             HandleKey(a, &ev.xkey);
             break;
         case ButtonPress:
@@ -1960,7 +2090,11 @@ static void Usage(const char *argv0)
         "Keys: Esc settings overlay, E target-area drag, F11 fullscreen, Ctrl+Q quit.\n"
         "In the overlay: Up/Down select, Left/Right adjust (Shift coarse), Enter run\n"
         "action, c/t/b set the capture region from the mouse, e drag target area, s save,\n"
-        "l reload, r defaults, m outline, f window mode, a always-on-top, v vsync, q quit.\n",
+        "l reload, r defaults, m outline, f window mode, a always-on-top, k click-through,\n"
+        "v vsync, q quit.\n"
+        "Click-through makes the window ignore the pointer, so windows behind it can be driven\n"
+        "while the viewer stays up.  Ctrl+Alt+C releases it from anywhere, k releases it when\n"
+        "the window has the keyboard.\n",
         argv0);
 }
 
@@ -2143,6 +2277,11 @@ int main(int argc, char **argv)
     app.wm_delete_window = XInternAtom(app.dpy, "WM_DELETE_WINDOW", False);
     app.net_wm_state = XInternAtom(app.dpy, "_NET_WM_STATE", False);
     app.net_wm_state_fullscreen = XInternAtom(app.dpy, "_NET_WM_STATE_FULLSCREEN", False);
+    app.net_wm_state_above = XInternAtom(app.dpy, "_NET_WM_STATE_ABOVE", False);
+    app.shape = XShape_Open();
+    if (!XShape_Supported(app.shape)) {
+        fprintf(stderr, "supercrt: libXext/XShape unavailable; click-through disabled\n");
+    }
 
     app.width = g_params.DstWidth;
     app.height = g_params.DstHeight;
@@ -2369,6 +2508,11 @@ int main(int argc, char **argv)
             Marker_SetRect(app.marker, g_params.SrcX, g_params.SrcY, g_params.SrcWidth, g_params.SrcHeight);
             RegionRemember(last_region, &g_params);
         }
+        // Always-on-top and click-through, pushed only when the value changed.
+        App_ApplyWindowState(&app);
+        // Borderless mode has no window manager to honour _NET_WM_STATE_ABOVE, so it keeps
+        // itself in front directly.  Every other mode leaves it to the WM, which is what
+        // lets a window behind be focused and driven without the viewer dropping behind.
         if (app.mode == 2 && g_params.AlwaysOnTop && (app.frame_index % 120) == 0) {
             XRaiseWindow(app.dpy, app.win);
         }
@@ -2422,6 +2566,8 @@ int main(int argc, char **argv)
     // window are handed back explicitly because they outlive the connection otherwise.
     Capture_Destroy(app.capture);
     Marker_Destroy(app.marker);
+    App_GrabHotkey(&app, 0);
+    XShape_Close(app.shape);
     UI_Shutdown(&app.ui);
     XDestroyWindow(app.dpy, app.win);
     XCloseDisplay(app.dpy);

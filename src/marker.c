@@ -1,5 +1,4 @@
 // See marker.h.
-#include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,15 +6,7 @@
 #include <X11/Xutil.h>
 
 #include "marker.h"
-
-// X11/extensions/shape.h constants and entry points, restated (libxext-dev is not a
-// build requirement; libXext is dlopen'd).  Values matter: ShapeBounding is 0 and
-// ShapeInput is 2, so swapping them silently blanks the window.
-#define SHAPE_SET 0
-#define SHAPE_UNSORTED 0
-#define SHAPE_BOUNDING 0
-#define SHAPE_CLIP 1
-#define SHAPE_INPUT 2
+#include "xshape.h"
 
 // Room outside the sampled rectangle for the frame and the brackets.
 #define MARKER_PAD 9
@@ -35,8 +26,7 @@ struct Marker {
     int enabled;
     int interactive;
     int supported;
-    void *xext;
-    void (*pCombineRectangles)(Display *, Window, int, int, int, XRectangle *, int, int, int);
+    XShapeApi *shape;
 };
 
 Marker *Marker_Create(Display *dpy, int screen)
@@ -48,12 +38,7 @@ Marker *Marker_Create(Display *dpy, int screen)
     m->dpy = dpy;
     m->screen = screen;
 
-    m->xext = dlopen("libXext.so.6", RTLD_NOW | RTLD_LOCAL);
-    if (m->xext) {
-        m->pCombineRectangles =
-            (void (*)(Display *, Window, int, int, int, XRectangle *, int, int, int))
-                dlsym(m->xext, "XShapeCombineRectangles");
-    }
+    m->shape = XShape_Open();
 
     Window root = RootWindow(dpy, screen);
     XSetWindowAttributes attrs;
@@ -70,7 +55,7 @@ Marker *Marker_Create(Display *dpy, int screen)
     gcv.foreground = COLOR_IDLE;
     m->gc = XCreateGC(dpy, m->win, GCForeground, &gcv);
 
-    m->supported = m->pCombineRectangles != NULL;
+    m->supported = XShape_Supported(m->shape);
     if (!m->supported) {
         fprintf(stderr, "supercrt: libXext/XShape unavailable; target outline disabled\n");
         return m;
@@ -92,9 +77,7 @@ void Marker_Destroy(Marker *m)
     if (m->gc) {
         XFreeGC(m->dpy, m->gc);
     }
-    if (m->xext) {
-        dlclose(m->xext);
-    }
+    XShape_Close(m->shape);
     free(m);
 }
 
@@ -152,11 +135,10 @@ static void Marker_ApplyShapes(Marker *m)
         count += 8;
     }
 
-    m->pCombineRectangles(m->dpy, m->win, SHAPE_BOUNDING, 0, 0, rects, count, SHAPE_SET,
-                          SHAPE_UNSORTED);
+    XShape_SetBounding(m->shape, m->dpy, m->win, rects, count);
 
     // Empty input shape: clicks and focus pass straight through to whatever is below.
-    m->pCombineRectangles(m->dpy, m->win, SHAPE_INPUT, 0, 0, NULL, 0, SHAPE_SET, SHAPE_UNSORTED);
+    XShape_SetEmptyInput(m->shape, m->dpy, m->win);
 }
 
 void Marker_WindowRect(int x, int y, int width, int height, int *out_x, int *out_y, int *out_w,

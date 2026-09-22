@@ -13,7 +13,8 @@ typedef struct {
     int   Fullscreen;        // 0 = windowed, 1 = Fullscreen, 2 = FullscreenWindowed
     int   VSync;
     int   CaptureOutline;    // draw the click-through capture-region frame
-    int   AlwaysOnTop;       // re-raise the output window in fullscreen modes
+    int   AlwaysOnTop;       // ask the WM to keep the output window above other windows
+    int   ClickThrough;      // empty input shape: the pointer passes through the window
 
     // --- Composite pass ---
     float Sharp;             // Tuning_Sharp

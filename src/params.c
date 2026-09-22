@@ -26,7 +26,8 @@ void Params_Defaults(Params *p)
     p->Fullscreen = 0;
     p->VSync = 1;
     p->CaptureOutline = 1;
-    p->AlwaysOnTop = 1;
+    p->AlwaysOnTop = 0;
+    p->ClickThrough = 0;
 
     p->Sharp = 0.8f;
     p->Persistence[0] = 0.7f;
@@ -147,6 +148,7 @@ static int ApplyKey(Params *p, const char *key, const char *value)
     if (!strcasecmp(key, "VSync"))            { p->VSync = ParseBool(value); return 1; }
     if (!strcasecmp(key, "CaptureOutline"))   { p->CaptureOutline = ParseBool(value); return 1; }
     if (!strcasecmp(key, "AlwaysOnTop"))      { p->AlwaysOnTop = ParseBool(value); return 1; }
+    if (!strcasecmp(key, "ClickThrough"))     { p->ClickThrough = ParseBool(value); return 1; }
 
     // Accept the reference's packed spelling as well as the per-channel keys.
     if (!strcasecmp(key, "Persistence")) {
@@ -244,7 +246,8 @@ int Params_Save(const Params *p, const char *path)
     fprintf(f, "FullscreenWindowed=%s\n", p->Fullscreen == 2 ? "true" : "false");
     fprintf(f, "VSync=%s\n", p->VSync ? "true" : "false");
     fprintf(f, "CaptureOutline=%s\n", p->CaptureOutline ? "true" : "false");
-    fprintf(f, "AlwaysOnTop=%s\n\n", p->AlwaysOnTop ? "true" : "false");
+    fprintf(f, "AlwaysOnTop=%s\n", p->AlwaysOnTop ? "true" : "false");
+    fprintf(f, "ClickThrough=%s\n\n", p->ClickThrough ? "true" : "false");
 
     fprintf(f, "[CRT]\n");
     int n = 0;
