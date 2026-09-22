@@ -38,9 +38,10 @@ If you find this effect useful, the credit belongs upstream.
 - **X11 desktop capture** via MIT-SHM (`XShmGetImage`), with an `XGetImage` fallback.
 - **No Visual Studio, no C++.** Plain C99, one `Makefile`, dependencies are `libX11` and
   `libGL` only.
-- **Live settings overlay** written from scratch: an on-screen config menu you can click
-  or drive from the keyboard, plus drag-to-place sampling-rectangle targeting. Upstream
-  leaves tuning to its source constants and config.
+- **Live settings overlay** written from scratch: a translucent card drawn over the running
+  sim, with a scrolling settings list you can click, scroll or drive from the keyboard, plus
+  drag-to-place sampling-rectangle targeting. Upstream leaves tuning to its source constants
+  and config.
 - **Always-on-top and click-through**, so the viewer can sit over the desktop while windows
   behind it are driven — see below.
 - **INI config** (`supercrt.ini`) with field names mapped 1:1 onto upstream's
@@ -97,6 +98,15 @@ Assets are searched for as `assets/*` beside the binary, then `../assets`,
   `a` always-on-top, `k` click-through, `i` ignore own output, `v` vsync, `s` save,
   `l` reload, `r` defaults, `q` quit. These all need the overlay open, which is why
   click-through also has a global chord: **Ctrl+Alt+C**.
+- The overlay is a **translucent card floating over the sim**, not a screen-filling panel:
+  the CRT keeps playing around and through it while you tune, which is the point of tuning
+  over a live image. The card scales with the window (capped at 480px wide and ~62% tall)
+  and the settings list lives in **one column under two headers** — `CRT tuning`, then
+  `Actions` — so nothing overlaps however small the window is. Rows run past the bottom of
+  that column rather than multiplying columns: **mouse wheel** scrolls three rows a notch,
+  **PageUp/PageDown** page, **Up/Down** keep the selected row in view, and the **scrollbar
+  thumb** on the right edge of the list can be dragged (clicking the track jumps to that
+  point). Text too long for the card is truncated rather than drawn over its neighbour.
 
 ### Configuration
 
@@ -182,7 +192,7 @@ Six passes, matching the reference `Render()`:
 | `src/shader.c`, `src/shaders.h` | GLSL programs / the translated shader source |
 | `src/assets.c` | BMP and `.m3d` loaders for the upstream data files |
 | `src/params.c`, `src/params.h` | Tunables, INI load/save, defaults |
-| `src/ui.c` | Settings overlay, sliders, bottom bar |
+| `src/ui.c` | Immediate-mode 2D layer: overlay card, sliders, bottom bar, clip rectangles |
 | `src/marker.c` | Capture-region outline overlay (XShape) |
 | `src/xshape.c` | XShape access for the outline and click-through (libXext, `dlopen`ed) |
 | `src/gl_api.c` | Runtime GL entry-point resolution |

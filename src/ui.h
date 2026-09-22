@@ -16,6 +16,7 @@ typedef struct {
     UIVertex *verts;
     int count, capacity;
     float width, height;
+    int clip_active;
 } UI;
 
 // Builds the program and uploads the baked font atlas.  Returns 1 on success.
@@ -33,6 +34,12 @@ void UI_TextF(UI *ui, float x, float y, float r, float g, float b, float a, cons
 // Width / line height of text in pixels, for layout.
 float UI_TextWidth(const char *text);
 float UI_LineHeight(void);
+
+// Clips everything queued afterwards to a window-pixel rectangle (origin top-left), so a
+// scrolling list can run past its frame without drawing over what is outside it.  UI_ClearClip
+// restores the whole window.  Each change flushes the batch it has already queued.
+void UI_SetClip(UI *ui, float x, float y, float w, float h);
+void UI_ClearClip(UI *ui);
 
 // Uploads and draws everything queued since UI_Begin.
 void UI_End(UI *ui);

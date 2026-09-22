@@ -239,6 +239,13 @@ typedef struct {
     int even_frame;
     int overlay_open;
     int overlay_selected;
+    int overlay_scroll;         // first list row on screen; the list scrolls when it does not fit
+    int overlay_rows_visible;   // rows the card fits, recomputed every draw
+    int overlay_max_scroll;
+    Rectf overlay_card;         // the floating settings card, in window pixels
+    Rectf overlay_track;        // scrollbar track and thumb; empty when the whole list fits
+    Rectf overlay_thumb;
+    int overlay_thumb_drag;
     int capture_outline_enabled;
     int on_top_applied;          // last value pushed to the WM, -1 to force a re-apply
     int click_through_applied;   // likewise for the input shape
@@ -1627,6 +1634,125 @@ static void Overlay_RowCount(int *tunable_count, int *action_count)
     *action_count = (int)(sizeof(kActions) / sizeof(kActions[0]));
 }
 
+// The list is drawn under two section headers -- tuning, then actions -- which are not
+// selectable, so a flat row index (tunables then actions, the order RunAction and
+// Overlay_Adjust use) maps onto a display row through this offset.
+static int Overlay_DisplayRow(int flat, int tunable_count)
+{
+    return flat + 1 + (flat >= tunable_count ? 1 : 0);
+}
+
+static int Overlay_DisplayRows(int tunable_count, int action_count)
+{
+    return tunable_count + action_count + 2;
+}
+
+// Settings text is laid out from measured widths, so nothing can overlap whatever size the
+// window is: this cuts a string short with a trailing ".." when it will not fit.
+static void ElideEnd(char *dst, size_t cap, const char *src, float max_w)
+{
+    size_t n = strlen(src);
+    if (n + 1 > cap) {
+        n = cap - 1;
+    }
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+    if (UI_TextWidth(dst) <= max_w) {
+        return;
+    }
+
+    const float dots = UI_TextWidth("..");
+    while (n > 0 && UI_TextWidth(dst) + dots > max_w) {
+        dst[--n] = '\0';
+    }
+    if (n + 2 < cap) {
+        dst[n++] = '.';
+        dst[n++] = '.';
+        dst[n] = '\0';
+    }
+}
+
+// Same, but keeps the *end* of the string: a config path is identified by its tail.  The
+// source is longer than any buffer here (it is a PATH_MAX-ish config path), so both copies
+// carry an explicit precision rather than relying on the destination size.
+static void ElideFront(char *dst, size_t cap, const char *src, float max_w)
+{
+    const int room = cap > 1 ? (int)cap - 1 : 0;
+    if (UI_TextWidth(src) <= max_w) {
+        snprintf(dst, cap, "%.*s", room, src);
+        return;
+    }
+    const float dots = UI_TextWidth("..");
+    const char *start = src;
+    while (*start && UI_TextWidth(start) + dots > max_w) {
+        ++start;
+    }
+    snprintf(dst, cap, "..%.*s", room - 2 > 0 ? room - 2 : 0, start);
+}
+
+// Scrolls the minimum amount that puts the selected row inside the visible window.  Driven
+// from the keys that move the selection; the mouse wheel scrolls freely instead, so it is
+// deliberately not called from the draw.
+static void Overlay_ScrollToSelection(App *a)
+{
+    int tunable_count = 0, action_count = 0;
+    Overlay_RowCount(&tunable_count, &action_count);
+    const int rows = a->overlay_rows_visible;
+    if (rows <= 0) {
+        return;
+    }
+    const int row = Overlay_DisplayRow(a->overlay_selected, tunable_count);
+    if (row < a->overlay_scroll) {
+        a->overlay_scroll = row;
+    } else if (row >= a->overlay_scroll + rows) {
+        a->overlay_scroll = row - rows + 1;
+    }
+    if (a->overlay_scroll > a->overlay_max_scroll) {
+        a->overlay_scroll = a->overlay_max_scroll;
+    }
+    if (a->overlay_scroll < 0) {
+        a->overlay_scroll = 0;
+    }
+}
+
+// A page is however many rows the card is showing, which the last draw measured.  The
+// fallback only matters before the first draw, when nothing has been laid out yet.
+static int Overlay_PageRows(const App *a)
+{
+    return a->overlay_rows_visible > 1 ? a->overlay_rows_visible : 10;
+}
+
+// Mouse wheel over the open overlay: three rows a notch.  The selection stays where it is --
+// scrolling away from it is a legitimate thing to want to do, so this does not pull it back.
+static void Overlay_Wheel(App *a, int notches)
+{
+    a->overlay_scroll += notches * 3;
+    if (a->overlay_scroll < 0) {
+        a->overlay_scroll = 0;
+    }
+    if (a->overlay_scroll > a->overlay_max_scroll) {
+        a->overlay_scroll = a->overlay_max_scroll;
+    }
+}
+
+// Dragging the thumb: the pointer's position in the track sets the scroll outright, so the
+// thumb tracks the pointer instead of accumulating deltas.
+static void Overlay_ThumbDrag(App *a, float pointer_y)
+{
+    const float travel = a->overlay_track.h - a->overlay_thumb.h;
+    if (travel <= 0.0f || a->overlay_max_scroll <= 0) {
+        return;
+    }
+    float t = (pointer_y - a->overlay_track.y - a->overlay_thumb.h * 0.5f) / travel;
+    if (t < 0.0f) {
+        t = 0.0f;
+    }
+    if (t > 1.0f) {
+        t = 1.0f;
+    }
+    a->overlay_scroll = (int)lroundf(t * (float)a->overlay_max_scroll);
+}
+
 static void RunAction(App *a, ActionKind action)
 {
     int root_x = 0, root_y = 0, win_x = 0, win_y = 0;
@@ -1725,93 +1851,201 @@ static void Overlay_Draw(App *a)
 {
     UI *ui = &a->ui;
     const float line = UI_LineHeight();
-    const float margin = 18.0f;
+    const float margin = 14.0f;
+    const float pad = 14.0f;
+    const float scrollbar_w = 8.0f;
     a->overlay_hit_count = 0;
-
-    // Translucent panel so the settings stay readable over the sim.
-    UI_Rect(ui, 0.0f, 0.0f, (float)a->width, (float)a->height, 0.02f, 0.02f, 0.05f, 0.82f);
-
-    float y = margin;
-    UI_TextF(ui, margin, y, 0.55f, 0.95f, 0.75f, 1.0f, "SuperCRT (Linux port)  %dx%d  %.0f fps", a->width, a->height, a->fps);
-    UI_Text(ui, (float)a->width - margin - 40.0f, y, 0.95f, 0.6f, 0.6f, 1.0f, "close [X]");
-    a->hud_close = (Rectf){ (float)a->width - margin - 46.0f, y - 3.0f, 52.0f, line, };
-    y += line;
-    UI_Text(ui, margin, y, 0.75f, 0.75f, 0.8f, 1.0f,
-            "Mouse: click a row to select, drag the value to change it, click an action to run it");
-    y += line;
-    UI_Text(ui, margin, y, 0.75f, 0.75f, 0.8f, 1.0f,
-            "Keys: Esc close  Up/Down select  Left/Right adjust (Shift coarse)  Enter run action  E drag target area");
-    y += line;
-    UI_TextF(ui, margin, y, 0.75f, 0.75f, 0.8f, 1.0f,
-             "Capture: %d,%d %dx%d  grab: %s  screen: %dx%d",
-             g_params.SrcX, g_params.SrcY, g_params.SrcWidth, g_params.SrcHeight,
-             a->using_shm ? "MIT-SHM" : "XGetImage", a->screen_width, a->screen_height);
-    y += line * 1.4f;
 
     int tunable_count = 0, action_count = 0;
     Overlay_RowCount(&tunable_count, &action_count);
-    const int total = tunable_count + action_count;
-    if (a->overlay_selected >= total) {
-        a->overlay_selected = total - 1;
+    const int flat_total = tunable_count + action_count;
+    const int display_total = Overlay_DisplayRows(tunable_count, action_count);
+    if (a->overlay_selected < 0) {
+        a->overlay_selected = 0;
+    }
+    if (a->overlay_selected >= flat_total) {
+        a->overlay_selected = flat_total - 1;
     }
 
+    // A floating card rather than a full-window panel: the settings go on top of the sim, and
+    // the sim stays visible on every side of them.  Width and height are both a fraction of
+    // the window with hard caps, and the list scrolls rather than columns multiplying, so no
+    // window size can make two rows collide.
+    float card_w = (float)a->width * 0.58f;
+    if (card_w > 480.0f) {
+        card_w = 480.0f;
+    }
+    if (card_w > (float)a->width - margin * 2.0f) {
+        card_w = (float)a->width - margin * 2.0f;
+    }
+    if (card_w < 240.0f) {
+        card_w = (float)a->width - 8.0f;   // window narrower than the card: give up the margins
+    }
+    if (card_w < 120.0f) {
+        card_w = 120.0f;
+    }
+
+    const float content_w = card_w - pad * 2.0f - scrollbar_w;
+    // Chrome: title + two hint lines above the list, config + status below, and a 12px gap
+    // either side of it for the separators.
+    const float chrome_h = pad * 2.0f + line * 5.0f + 24.0f;
+
+    float cap_h = (float)a->height * 0.62f;
+    if (cap_h < chrome_h + line * 6.0f) {
+        cap_h = chrome_h + line * 6.0f;   // short window: keep a usable list, the CRT keeps the rest
+    }
+    if (cap_h > (float)a->height - margin * 2.0f) {
+        cap_h = (float)a->height - margin * 2.0f;
+    }
+
+    int rows_visible = (int)((cap_h - chrome_h) / line);
+    if (rows_visible > 14) {
+        rows_visible = 14;
+    }
+    if (rows_visible < 1) {
+        rows_visible = 1;
+    }
+    int max_scroll = display_total - rows_visible;
+    if (max_scroll < 0) {
+        max_scroll = 0;
+    }
+    if (a->overlay_scroll < 0) {
+        a->overlay_scroll = 0;
+    }
+    if (a->overlay_scroll > max_scroll) {
+        a->overlay_scroll = max_scroll;
+    }
+
+    const float card_h = chrome_h + (float)rows_visible * line;
+    // Whole-pixel placement: a centered card lands on a half pixel whenever either
+    // dimension is odd, and half-pixel glyph origins are what make the bitmap font resample.
+    const float card_x = floorf((float)a->width * 0.5f - card_w * 0.5f);
+    float card_y = floorf((float)a->height * 0.5f - card_h * 0.5f);
+    if (card_y < 2.0f) {
+        card_y = 2.0f;
+    }
+    a->overlay_rows_visible = rows_visible;
+    a->overlay_max_scroll = max_scroll;
+    a->overlay_card = (Rectf){ card_x, card_y, card_w, card_h };
+
+    // Translucent, and only as big as the card: the sim keeps playing around it and shows
+    // through it, which is the whole point of tuning over the live image.
+    UI_Rect(ui, card_x, card_y, card_w, card_h, 0.03f, 0.04f, 0.07f, 0.86f);
+    UI_Rect(ui, card_x, card_y, card_w, 2.0f, 0.30f, 0.45f, 0.70f, 0.9f);
+    UI_Rect(ui, card_x, card_y + card_h - 2.0f, card_w, 2.0f, 0.30f, 0.45f, 0.70f, 0.9f);
+
+    float y = card_y + pad;
+    char text[192];
+    char cap_text[192];
+
+    const float close_w = UI_TextWidth("close [X]");
+    const float close_x = card_x + card_w - pad - close_w;
+    // The title is cut to whatever is left of the close label: on a narrow card the two would
+    // otherwise be drawn through each other.
+    snprintf(text, sizeof(text), "SuperCRT  %dx%d  %.0f fps", a->width, a->height, a->fps);
+    ElideEnd(text, sizeof(text), text, close_x - 14.0f - (card_x + pad));
+    UI_Text(ui, card_x + pad, y, 0.55f, 0.95f, 0.75f, 1.0f, text);
+    UI_Text(ui, close_x, y, 0.95f, 0.6f, 0.6f, 1.0f, "close [X]");
+    a->hud_close = (Rectf){ close_x - 6.0f, y - 3.0f, close_w + 12.0f, line };
+
+    // Whatever is left of the title line reports where the pixels are coming from, when it fits.
+    const float cap_x = card_x + pad + UI_TextWidth(text) + 16.0f;
+    const float cap_room = close_x - 12.0f - cap_x;
+    if (cap_room > 60.0f) {
+        snprintf(cap_text, sizeof(cap_text), "%s  %d,%d %dx%d",
+                 a->using_shm ? "MIT-SHM" : "XGetImage", g_params.SrcX, g_params.SrcY,
+                 g_params.SrcWidth, g_params.SrcHeight);
+        ElideEnd(cap_text, sizeof(cap_text), cap_text, cap_room);
+        UI_Text(ui, cap_x, y, 0.62f, 0.68f, 0.78f, 1.0f, cap_text);
+    }
+    y += line;
+
+    // Short hints, not paragraphs: a card this size holds two lines of them, and every wider
+    // string is truncated to what is actually there.
+    ElideEnd(text, sizeof(text), "Up/Down select, Left/Right adjust, Enter runs", content_w);
+    UI_Text(ui, card_x + pad, y, 0.72f, 0.76f, 0.84f, 1.0f, text);
+    y += line;
+    ElideEnd(text, sizeof(text), "click a row or drag its track - wheel scrolls", content_w);
+    UI_Text(ui, card_x + pad, y, 0.72f, 0.76f, 0.84f, 1.0f, text);
+    y += line;
+
+    const float sep_w = content_w + scrollbar_w;
+    UI_Rect(ui, card_x + pad, y + 6.0f, sep_w, 1.0f, 0.30f, 0.34f, 0.44f, 1.0f);
+    y += 12.0f;
+
+    const float rows_x = card_x + pad;
+    const float rows_y = y;
+    const float rows_h = (float)rows_visible * line;
     const Tunable *tunables = Params_Tunables(&tunable_count);
 
-    // Two footer lines plus the panel margin stay clear of the rows, and the columns
-    // share whatever width is left, so the panel fits windows as small as a few hundred
-    // pixels without spilling rows off the edge.
-    const float footer_height = line * 2.0f;
-    float rows_area = (float)a->height - y - footer_height - margin * 2.0f;
-    int rows_per_column = (int)(rows_area / line);
-    if (rows_per_column < 4) {
-        rows_per_column = 4;
-    }
-    int columns = (total + rows_per_column - 1) / rows_per_column;
-    if (columns < 1) {
-        columns = 1;
-    }
-    const float column_width = (((float)a->width - margin * 2.0f) / (float)columns);
+    // The list is clipped to its own frame, so a row can never draw over the card's header,
+    // footer or edge however the window is sized.
+    UI_SetClip(ui, rows_x - 6.0f, rows_y, sep_w + 12.0f, rows_h);
+    for (int slot = 0; slot < rows_visible; ++slot) {
+        const int drow = a->overlay_scroll + slot;
+        if (drow >= display_total) {
+            break;
+        }
+        const float row_y = rows_y + (float)slot * line;
 
-    for (int i = 0; i < total; ++i) {
-        const int column = i / rows_per_column;
-        const int row = i % rows_per_column;
-        const float x = margin + (float)column * column_width;
-        const float row_y = y + (float)row * line;
-        const int selected = (i == a->overlay_selected);
-
-        if (selected) {
-            UI_Rect(ui, x - 4.0f, row_y - 1.0f, column_width - 8.0f, line, 0.25f, 0.5f, 0.85f, 0.55f);
+        // Section headers occupy display rows but are not selectable and are never hit.  Row
+        // indices are flat -- tunables first, then actions -- so an action's flat index is
+        // tunable_count + its position, which is what the two offsets below produce.
+        const char *header = NULL;
+        int flat = -1;
+        if (drow == 0) {
+            snprintf(text, sizeof(text), "CRT tuning  (%d)", tunable_count);
+            header = text;
+        } else if (drow == 1 + tunable_count) {
+            snprintf(text, sizeof(text), "Actions  (%d)", action_count);
+            header = text;
+        } else if (drow < 1 + tunable_count) {
+            flat = drow - 1;
+        } else {
+            flat = drow - 2;
         }
 
-        char text[192];
+        if (header) {
+            UI_Text(ui, rows_x, row_y, 0.50f, 0.72f, 0.98f, 1.0f, header);
+            UI_Rect(ui, rows_x, row_y + line - 5.0f, UI_TextWidth(header), 1.0f, 0.25f, 0.40f,
+                    0.60f, 1.0f);
+            continue;
+        }
+
+        const int selected = (flat == a->overlay_selected);
+        if (selected) {
+            UI_Rect(ui, rows_x - 5.0f, row_y - 1.0f, sep_w + 2.0f, line, 0.25f, 0.5f, 0.85f, 0.55f);
+        }
+
         OverlayHit *hit = NULL;
         if (a->overlay_hit_count < (int)(sizeof(a->overlay_hits) / sizeof(a->overlay_hits[0]))) {
             hit = &a->overlay_hits[a->overlay_hit_count++];
             memset(hit, 0, sizeof(*hit));
-            hit->row = (Rectf){ x - 6.0f, row_y - 2.0f, column_width - 4.0f, line };
-            hit->index = i;
+            hit->row = (Rectf){ rows_x - 6.0f, row_y - 2.0f, sep_w + 2.0f, line };
+            hit->index = flat;
         }
 
-        if (i < tunable_count) {
-            const Tunable *t = &tunables[i];
+        if (flat < tunable_count) {
+            const Tunable *t = &tunables[flat];
             char value[64];
             if (t->is_int) {
                 snprintf(value, sizeof(value), t->fmt, *(const int *)t->ptr);
             } else {
                 snprintf(value, sizeof(value), t->fmt, (double)*(const float *)t->ptr);
             }
-            snprintf(text, sizeof(text), "%-24s %s", t->label, value);
-            UI_Text(ui, x, row_y, 0.92f, 0.92f, 0.95f, 1.0f, text);
 
-            if (hit) {
-                hit->is_action = 0;
-                hit->slider = (Rectf){ x + column_width * 0.52f, row_y - 2.0f,
-                                       column_width * 0.46f, line };
-            }
+            // Track at the right edge, value right-aligned in front of it, label in whatever
+            // is left -- each column measured from its own text, so a narrow card truncates
+            // rather than colliding.
+            const float track_w = content_w * 0.30f;
+            const float track_x = rows_x + content_w - track_w;
+            const float value_x = track_x - 10.0f - UI_TextWidth(value);
+            ElideEnd(text, sizeof(text), t->label, value_x - rows_x - 10.0f);
+            UI_Text(ui, rows_x, row_y, 0.92f, 0.92f, 0.95f, 1.0f, text);
+            UI_Text(ui, value_x, row_y, 1.0f, 0.95f, 0.6f, 1.0f, value);
+
             // Value track: communicates that the row is draggable.
             const float track_y = row_y + line * 0.5f;
-            const float track_x = x + column_width * 0.52f;
-            const float track_w = column_width * 0.40f;
             UI_Rect(ui, track_x, track_y - 2.0f, track_w, 4.0f, 0.25f, 0.27f, 0.32f, 0.9f);
             float fraction = 0.0f;
             if (!t->is_int && t->max > t->min) {
@@ -1822,20 +2056,65 @@ static void Overlay_Draw(App *a)
             if (fraction < 0.0f) fraction = 0.0f;
             if (fraction > 1.0f) fraction = 1.0f;
             UI_Rect(ui, track_x, track_y - 2.0f, track_w * fraction, 4.0f, 0.45f, 0.75f, 0.95f, 1.0f);
+
+            if (hit) {
+                hit->is_action = 0;
+                hit->slider = (Rectf){ track_x - 4.0f, row_y - 2.0f, track_w + 8.0f, line };
+            }
         } else {
-            const OverlayAction *action = &kActions[i - tunable_count];
+            const OverlayAction *action = &kActions[flat - tunable_count];
             snprintf(text, sizeof(text), "[%s] %s", action->hint, action->label);
-            UI_Text(ui, x, row_y, 0.6f, 0.9f, 0.7f, 1.0f, text);
+            ElideEnd(text, sizeof(text), text, content_w);
+            UI_Text(ui, rows_x, row_y, 0.6f, 0.9f, 0.7f, 1.0f, text);
             if (hit) {
                 hit->is_action = 1;
             }
         }
     }
-    const float footer = (float)a->height - margin - footer_height + line * 0.2f;
-    UI_TextF(ui, margin, footer, 0.7f, 0.7f, 0.75f, 1.0f, "config: %s  %s",
-             a->config_path, a->dirty_settings ? "(unsaved changes)" : "");
+    UI_ClearClip(ui);
+
+    // Scrollbar, drawn only when there is something to scroll: shows how long the list is and
+    // where in it you are, and the thumb is draggable.  The hit area is wider than the 5px
+    // track so it is grabbable with a remote pointer.
+    if (max_scroll > 0) {
+        const float track_x = card_x + card_w - pad - 6.0f;
+        const float track_w = 5.0f;
+        UI_Rect(ui, track_x, rows_y, track_w, rows_h, 0.18f, 0.20f, 0.26f, 0.9f);
+        float thumb_h = rows_h * (float)rows_visible / (float)display_total;
+        if (thumb_h < 24.0f) {
+            thumb_h = 24.0f;
+        }
+        if (thumb_h > rows_h) {
+            thumb_h = rows_h;
+        }
+        const float thumb_y =
+            rows_y + (rows_h - thumb_h) * (float)a->overlay_scroll / (float)max_scroll;
+        UI_Rect(ui, track_x, thumb_y, track_w, thumb_h, 0.45f, 0.75f, 0.95f, 1.0f);
+        a->overlay_track = (Rectf){ track_x - 6.0f, rows_y, track_w + 12.0f, rows_h };
+        a->overlay_thumb = (Rectf){ track_x - 6.0f, thumb_y, track_w + 12.0f, thumb_h };
+    } else {
+        a->overlay_track = (Rectf){ 0, 0, 0, 0 };
+        a->overlay_thumb = (Rectf){ 0, 0, 0, 0 };
+    }
+
+    float footer_y = rows_y + rows_h + 12.0f;
+    UI_Rect(ui, card_x + pad, footer_y - 6.0f, sep_w, 1.0f, 0.30f, 0.34f, 0.44f, 1.0f);
+
+    const char *dirty = a->dirty_settings ? "  (unsaved changes)" : "";
+    float path_room = content_w - UI_TextWidth("config: ") - UI_TextWidth(dirty);
+    if (path_room < 40.0f) {
+        path_room = 40.0f;
+    }
+    char path[192];
+    ElideFront(path, sizeof(path), a->config_path, path_room);
+    snprintf(text, sizeof(text), "config: %.*s%s",
+             (int)(sizeof(text) - sizeof("config: ") - sizeof("  (unsaved changes)")), path, dirty);
+    ElideEnd(text, sizeof(text), text, content_w);
+    UI_Text(ui, card_x + pad, footer_y, 0.7f, 0.7f, 0.75f, 1.0f, text);
+
     if (a->status_frames > 0) {
-        UI_Text(ui, margin, footer + line, 1.0f, 0.9f, 0.4f, 1.0f, a->status);
+        ElideEnd(text, sizeof(text), a->status, content_w);
+        UI_Text(ui, card_x + pad, footer_y + line, 1.0f, 0.9f, 0.4f, 1.0f, text);
     }
 }
 
@@ -2152,6 +2431,10 @@ static void OnButtonPress(App *a, XButtonEvent *ev)
 {
     Trace("press btn=%u win=(%d,%d) root=(%d,%d) edit=%d overlay=%d", ev->button, ev->x, ev->y,
           ev->x_root, ev->y_root, a->edit_mode, a->overlay_open);
+    if (a->overlay_open && (ev->button == Button4 || ev->button == Button5)) {
+        Overlay_Wheel(a, ev->button == Button4 ? -1 : +1);
+        return;
+    }
     if (ev->button != Button1) {
         return;
     }
@@ -2169,6 +2452,13 @@ static void OnButtonPress(App *a, XButtonEvent *ev)
     if (a->overlay_open) {
         if (RectContains(a->hud_close, (float)ev->x, (float)ev->y)) {
             a->overlay_open = 0;
+            return;
+        }
+        // The scrollbar is checked before the rows: its grab area overlaps the right edge of
+        // the list on purpose, and a drag on it must not also select a row.
+        if (RectContains(a->overlay_track, (float)ev->x, (float)ev->y)) {
+            a->overlay_thumb_drag = 1;
+            Overlay_ThumbDrag(a, (float)ev->y);
             return;
         }
         OverlayHit *hits = a->overlay_hits;
@@ -2205,6 +2495,7 @@ static void OnButtonPress(App *a, XButtonEvent *ev)
     if (RectContains(a->hud_settings, (float)ev->x, (float)ev->y)) {
         a->overlay_open = 1;
         a->overlay_selected = 0;
+        Overlay_ScrollToSelection(a);
         return;
     }
     if (RectContains(a->hud_target, (float)ev->x, (float)ev->y)) {
@@ -2225,6 +2516,7 @@ static void OnButtonRelease(App *a, XButtonEvent *ev)
         a->region_drag_zone = ZONE_OUTSIDE;
         return;
     }
+    a->overlay_thumb_drag = 0;
     a->slider_row = -1;
 }
 
@@ -2232,6 +2524,10 @@ static void OnMotion(App *a, XMotionEvent *ev)
 {
     if (a->edit_mode && a->region_drag_zone != ZONE_OUTSIDE) {
         Trace("motion root=(%d,%d) drag", ev->x_root, ev->y_root);
+    }
+    if (a->overlay_thumb_drag) {
+        Overlay_ThumbDrag(a, (float)ev->y);
+        return;
     }
     if (a->edit_mode) {
         if (a->region_drag_zone != ZONE_OUTSIDE) {
@@ -2278,6 +2574,9 @@ static int HandleKey(App *a, XKeyEvent *key)
 
     if (sym == XK_Escape) {
         a->overlay_open = !a->overlay_open;
+        if (a->overlay_open) {
+            Overlay_ScrollToSelection(a);   // the row it was last left on may be scrolled out
+        }
         return 1;
     }
 
@@ -2302,18 +2601,22 @@ static int HandleKey(App *a, XKeyEvent *key)
         if (a->overlay_selected < 0) {
             a->overlay_selected = 0;
         }
+        Overlay_ScrollToSelection(a);
         return 1;
     case XK_Down:
         a->overlay_selected++;
+        Overlay_ScrollToSelection(a);
         return 1;
     case XK_Page_Up:
-        a->overlay_selected -= 10;
+        a->overlay_selected -= Overlay_PageRows(a);
         if (a->overlay_selected < 0) {
             a->overlay_selected = 0;
         }
+        Overlay_ScrollToSelection(a);
         return 1;
     case XK_Page_Down:
-        a->overlay_selected += 10;
+        a->overlay_selected += Overlay_PageRows(a);
+        Overlay_ScrollToSelection(a);
         return 1;
     case XK_Left:
         Overlay_Adjust(a, -1, shift);

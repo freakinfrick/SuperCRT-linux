@@ -1,4 +1,5 @@
 // See ui.h.
+#include <math.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -93,6 +94,7 @@ void UI_Begin(UI *ui, int width, int height)
     ui->count = 0;
     ui->width = (float)width;
     ui->height = (float)height;
+    ui->clip_active = 0;
 }
 
 static UIVertex *PushVerts(UI *ui, int n)
@@ -149,6 +151,13 @@ void UI_Text(UI *ui, float x, float y, float r, float g, float b, float a, const
     const float inv_w = 1.0f / (float)FONT_ATLAS_W;
     const float inv_h = 1.0f / (float)FONT_ATLAS_H;
 
+    // The atlas is a pixel font sampled with GL_NEAREST: a glyph drawn from a fractional
+    // origin lands between texels and resamples, which duplicates and drops whole scanlines
+    // of the bitmap.  Advances and offsets are whole pixels, so snapping the pen is enough
+    // to put every glyph in the string on the pixel grid.
+    x = floorf(x);
+    y = floorf(y);
+
     for (const unsigned char *p = (const unsigned char *)text; *p; ++p) {
         const Glyph *glyph = GlyphFor(*p);
         if (glyph->w && glyph->h) {
@@ -173,7 +182,9 @@ void UI_TextF(UI *ui, float x, float y, float r, float g, float b, float a, cons
     UI_Text(ui, x, y, r, g, b, a, buf);
 }
 
-void UI_End(UI *ui)
+// Draws everything queued so far and starts a new batch.  A clip change has to flush first:
+// the vertices carry no clip of their own, the scissor box applies to whole draw calls.
+static void UI_Flush(UI *ui)
 {
     if (ui->count == 0) {
         return;
@@ -198,6 +209,63 @@ void UI_End(UI *ui)
     glDrawArrays(GL_TRIANGLES, 0, ui->count);
     glBindVertexArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+    ui->count = 0;
+    Gl_Check("UI_Flush");
+}
+
+void UI_SetClip(UI *ui, float x, float y, float w, float h)
+{
+    UI_Flush(ui);
+
+    int sx = (int)floorf(x);
+    int sy = (int)floorf(y);
+    int sw = (int)ceilf(w);
+    int sh = (int)ceilf(h);
+    if (w <= 0.0f) {
+        sw = 0;
+    }
+    if (h <= 0.0f) {
+        sh = 0;
+    }
+    if (sx < 0) {
+        sw += sx;
+        sx = 0;
+    }
+    if (sy < 0) {
+        sh += sy;
+        sy = 0;
+    }
+    if (sw < 0) {
+        sw = 0;
+    }
+    if (sh < 0) {
+        sh = 0;
+    }
+
+    // Scissor is measured from the bottom-left of the drawable; the UI is top-left.
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(sx, (int)ui->height - (sy + sh), sw, sh);
+    ui->clip_active = 1;
+}
+
+void UI_ClearClip(UI *ui)
+{
+    UI_Flush(ui);
+    if (ui->clip_active) {
+        glDisable(GL_SCISSOR_TEST);
+        ui->clip_active = 0;
+    }
+}
+
+void UI_End(UI *ui)
+{
+    if (ui->count == 0 && !ui->clip_active) {
+        return;
+    }
+
+    UI_ClearClip(ui);
+    UI_Flush(ui);
     glUseProgram(0);
 
     glDisable(GL_BLEND);
