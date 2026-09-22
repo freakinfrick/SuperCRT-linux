@@ -60,20 +60,24 @@ void XShape_SetBounding(XShapeApi *api, Display *dpy, Window win, const XRectang
                             SHAPE_UNSORTED);
 }
 
-void XShape_SetEmptyInput(XShapeApi *api, Display *dpy, Window win)
+void XShape_SetInput(XShapeApi *api, Display *dpy, Window win, const XRectangle *rects,
+                     int count)
 {
     if (!XShape_Supported(api)) {
         return;
     }
-    api->combine_rectangles(dpy, win, SHAPE_INPUT, 0, 0, NULL, 0, SHAPE_SET, SHAPE_UNSORTED);
+    api->combine_rectangles(dpy, win, SHAPE_INPUT, 0, 0, (XRectangle *)rects, count, SHAPE_SET,
+                            SHAPE_UNSORTED);
+}
+
+void XShape_SetEmptyInput(XShapeApi *api, Display *dpy, Window win)
+{
+    XShape_SetInput(api, dpy, win, NULL, 0);
 }
 
 void XShape_SetFullInput(XShapeApi *api, Display *dpy, Window win, int width, int height)
 {
-    if (!XShape_Supported(api)) {
-        return;
-    }
-    XRectangle full = { 0, 0, (unsigned short)(width > 0 ? width : 1),
-                        (unsigned short)(height > 0 ? height : 1) };
-    api->combine_rectangles(dpy, win, SHAPE_INPUT, 0, 0, &full, 1, SHAPE_SET, SHAPE_UNSORTED);
+    const XRectangle full = { 0, 0, (unsigned short)(width > 0 ? width : 1),
+                              (unsigned short)(height > 0 ? height : 1) };
+    XShape_SetInput(api, dpy, win, &full, 1);
 }

@@ -15,6 +15,7 @@ typedef struct {
     int   CaptureOutline;    // draw the click-through capture-region frame
     int   AlwaysOnTop;       // ask the WM to keep the output window above other windows
     int   ClickThrough;      // empty input shape: the pointer passes through the window
+    int   IgnoreSelf;        // never sample this window's own output: keep clear, else hole
 
     // --- Composite pass ---
     float Sharp;             // Tuning_Sharp

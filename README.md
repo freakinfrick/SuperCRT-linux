@@ -94,9 +94,9 @@ Assets are searched for as `assets/*` beside the binary, then `../assets`,
   **Home/End** min/max, **Enter** run the selected action, and —
   `c` centre the capture on the cursor, `t` / `b` anchor the capture's top-left /
   bottom-right at the cursor, `e` drag target, `m` outline, `f` window mode,
-  `a` always-on-top, `k` click-through, `v` vsync, `s` save, `l` reload, `r` defaults,
-  `q` quit. These all need the overlay open, which is why click-through also has a
-  global chord: **Ctrl+Alt+C**.
+  `a` always-on-top, `k` click-through, `i` ignore own output, `v` vsync, `s` save,
+  `l` reload, `r` defaults, `q` quit. These all need the overlay open, which is why
+  click-through also has a global chord: **Ctrl+Alt+C**.
 
 ### Configuration
 
@@ -114,6 +114,7 @@ Both default to **off**.
 [Window]
 AlwaysOnTop=true     ; the viewer cannot be covered by other windows
 ClickThrough=true    ; the pointer passes through the viewer
+IgnoreSelf=true      ; the viewer never samples its own output (on by default)
 ```
 
 **`AlwaysOnTop`** asks the window manager to keep the viewer above other windows, so
@@ -132,6 +133,33 @@ which window has the keyboard, or by focusing the viewer and pressing **k** in t
 If another client already holds Ctrl+Alt+C the grab fails with a note on stderr; raise the
 viewer and press **k** instead. The viewer is normally also reachable through the window
 manager's own switcher (**Alt-Tab**), which does not go through the pointer.
+
+## Never sampling itself
+
+The capture reads the desktop, and the viewer draws to the desktop, so if the viewer overlaps
+the rectangle it samples it feeds its own output back in: the image cascades, and the sampled
+area is no longer what is really there. **`IgnoreSelf`** (on by default) makes that impossible,
+two ways:
+
+- **It keeps clear.** `App_WindowPlacement` already worked out a spot beside or below the
+  sampled rectangle, but that was only a request — window managers routinely ignore the geometry
+  a new window is created with, and KWin did exactly that, leaving the viewer on top of the
+  rectangle it was sampling. The placement is now asserted through `USPosition` hints and
+  re-requested for the first moment after the window appears, then left alone so a move you make
+  yourself is never fought.
+- **It punches a hole in itself.** Whenever the window would overlap the rectangle anyway — you
+  dragged it there, the screen is too small, or you are in fullscreen or borderless mode where
+  covering it is unavoidable — the viewer's bounding shape is cut so it paints everything
+  *except* the sampled rectangle. Those pixels stay exactly as the desktop drew them, so the
+  capture cannot contain the viewer's output no matter where the window is. The input shape gets
+  the same hole, so a pixel the viewer does not paint is also one it does not swallow.
+
+What you see in that case is a raw, un-CRT'd rectangle inside the viewer wherever it overlaps
+the sampled area — the desktop showing through the glass, which is the honest picture: those
+pixels are what is being sampled.
+
+With `IgnoreSelf=false` the old behaviour returns, including the feedback tunnel, which is
+worth having as an effect if you want it. `i` in the overlay toggles it.
 
 ## Pipeline
 

@@ -21,6 +21,13 @@ int XShape_Supported(const XShapeApi *api);
 void XShape_SetBounding(XShapeApi *api, Display *dpy, Window win, const XRectangle *rects,
                         int count);
 
+// Input shape from an explicit rectangle list: the region that receives pointer events.
+// Note that an empty list is a *valid* value here and means "no pointer input at all"
+// (shape.h: op ShapeSet with no rectangles empties the region), which is the click-through
+// mechanism rather than an error.
+void XShape_SetInput(XShapeApi *api, Display *dpy, Window win, const XRectangle *rects,
+                     int count);
+
 // Input shape: an empty region makes the window transparent to the pointer, so clicks,
 // drags and focus pass through to whatever is underneath.
 void XShape_SetEmptyInput(XShapeApi *api, Display *dpy, Window win);

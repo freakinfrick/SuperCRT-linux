@@ -242,7 +242,10 @@ typedef struct {
     int capture_outline_enabled;
     int on_top_applied;          // last value pushed to the WM, -1 to force a re-apply
     int click_through_applied;   // likewise for the input shape
+    int ignore_self_applied;     // likewise for the self-capture hole
     int hotkey_grabbed;
+    int placement_frames;        // frames left to insist on the requested window placement
+    int self_shape_dirty;        // geometry or the sampled rectangle moved: re-cut the hole
     double last_fps_time;
     int fps_frames;
     double fps;
@@ -648,8 +651,52 @@ static void App_WindowPlacement(App *a, int *width, int *height, int *x, int *y)
     }
 }
 
+// Is an EWMH window manager running?  EWMH specifies this as a *property* on the root that
+// holds the manager's window, which then advertises itself the same way; it is not a selection
+// owner.  Asking XGetSelectionOwner for it always returns None, which is why this used to
+// report "no window manager" under a perfectly good manager and EWMH fullscreen always fell
+// back to borderless.
+static int App_HasWindowManager(Display *dpy, Window root)
+{
+    const Atom check = XInternAtom(dpy, "_NET_SUPPORTING_WM_CHECK", False);
+    Window wm = None;
+    for (int pass = 0; pass < 2; ++pass) {
+        const Window target = pass ? wm : root;
+        Atom type = None;
+        int format = 0;
+        unsigned long items = 0, after = 0;
+        unsigned char *data = NULL;
+        const int status = XGetWindowProperty(dpy, target, check, 0, 1, False, XA_WINDOW, &type,
+                                              &format, &items, &after, &data);
+        if (status != Success || !data) {
+            if (data) {
+                XFree(data);
+            }
+            return 0;
+        }
+        const Window value = items ? *(Window *)data : None;
+        XFree(data);
+        if (value == None) {
+            return 0;
+        }
+        if (pass == 1) {
+            return value == wm; // it must point back at itself
+        }
+        wm = value;
+    }
+    return 0;
+}
+
+// How long to keep asking for the placement App_WindowPlacement computed.  Window managers
+// routinely place a new window themselves and ignore the geometry XCreateWindow was handed --
+// KWin does, which is how the viewer ended up sitting over the rectangle it samples.  Bounded
+// so a deliberate move by the user is never fought; past that the hole covers any overlap.
+#define PLACEMENT_FRAMES 90
+
 static void App_CreateWindow(App *a, int override_redirect, int width, int height)
 {
+    const Window previous = a->win; // the window this call replaces, if any
+
     int x = 0;
     int y = 0;
     if (!override_redirect) {
@@ -672,8 +719,32 @@ static void App_CreateWindow(App *a, int override_redirect, int width, int heigh
                            &attrs);
     a->window_is_override_redirect = override_redirect;
 
+    // The size is known here, and no ConfigureNotify follows a window created at the size it
+    // asked for: that event reports changes, and a borderless window has no manager to make
+    // any.  Missing this left mode 2 sized like the window it replaced, which every region,
+    // render target and HUD position is derived from.
+    a->width = width > 0 ? width : 1;
+    a->height = height > 0 ? height : 1;
+    if (!override_redirect) {
+        a->windowed_width = a->width;
+        a->windowed_height = a->height;
+    }
+
     XStoreName(a->dpy, a->win, "SuperCRT");
     XSetWMProtocols(a->dpy, a->win, &a->wm_delete_window, 1);
+
+    // Geometry is a request, not a command: most window managers place a new window by their
+    // own policy.  USPosition is the one hint they all treat as "the user asked for this", so
+    // the placement that keeps the viewer clear of the sampled rectangle survives mapping.
+    XSizeHints hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.flags = USPosition | USSize | PPosition | PSize;
+    hints.x = x;
+    hints.y = y;
+    hints.width = width;
+    hints.height = height;
+    XSetWMNormalHints(a->dpy, a->win, &hints);
+
     XMapWindow(a->dpy, a->win);
     XFlush(a->dpy);
 
@@ -683,9 +754,21 @@ static void App_CreateWindow(App *a, int override_redirect, int width, int heigh
     }
     a->swap_control = App_ApplySwapInterval(a, g_params.VSync ? 1 : 0);
 
+    // The replaced window is destroyed only once the new one is current, since the context
+    // still refers to it until then.  Leaving it mapped left a second copy of the viewer on
+    // screen painting the same simulation, and its events kept overwriting this window's
+    // geometry -- every region derived from a->width/a->height was cut for the wrong size.
+    if (previous) {
+        XDestroyWindow(a->dpy, previous);
+        XFlush(a->dpy);
+    }
+
     // WM state and input shapes belong to the window that was just thrown away.
     a->on_top_applied = -1;
     a->click_through_applied = -1;
+    a->ignore_self_applied = -1;
+    a->self_shape_dirty = 1;
+    a->placement_frames = PLACEMENT_FRAMES;
 }
 
 // ---------------------------------------------------------------------------
@@ -720,9 +803,79 @@ static void App_SetOnTop(App *a, int on)
     }
 }
 
-// An empty input shape is what makes the window transparent to the pointer: clicks, drags
-// and focus reach whatever is underneath.  Restoring a region needs the current size,
-// because an input shape does not follow the window geometry.
+// ---------------------------------------------------------------------------
+// Not sampling ourselves
+// ---------------------------------------------------------------------------
+
+// Where the sampled rectangle lands in this window's coordinates, or 0 width/height when the
+// two do not overlap.  The viewer draws its own output, and the capture reads the root window,
+// so any overlap feeds that output straight back into the next frame -- the tunnel effect.  On
+// plain X11 a root capture cannot exclude a window, so instead the window is made not to paint
+// there at all (see App_ApplySelfShape).
+static void App_SelfHole(App *a, int out[4])
+{
+    out[0] = out[1] = out[2] = out[3] = 0;
+    if (!g_params.IgnoreSelf || !a->win) {
+        return;
+    }
+    int rx = 0, ry = 0;
+    Window child = None;
+    if (!XTranslateCoordinates(a->dpy, a->win, a->root, 0, 0, &rx, &ry, &child)) {
+        return;
+    }
+
+    const int sx1 = g_params.SrcX + g_params.SrcWidth;
+    const int sy1 = g_params.SrcY + g_params.SrcHeight;
+    const int hx0 = g_params.SrcX > rx ? g_params.SrcX : rx;
+    const int hy0 = g_params.SrcY > ry ? g_params.SrcY : ry;
+    const int hx1 = sx1 < rx + a->width ? sx1 : rx + a->width;
+    const int hy1 = sy1 < ry + a->height ? sy1 : ry + a->height;
+    if (hx1 <= hx0 || hy1 <= hy0) {
+        return;
+    }
+    out[0] = hx0 - rx;
+    out[1] = hy0 - ry;
+    out[2] = hx1 - hx0;
+    out[3] = hy1 - hy0;
+}
+
+// This window's own pixels: everything but the hole, as up to four rectangles.  Bounding and
+// input share the list, so a pixel this window does not paint is also one it does not swallow.
+static int App_WindowRegion(App *a, XRectangle out[4])
+{
+    const int w = a->width > 0 ? a->width : 1;
+    const int h = a->height > 0 ? a->height : 1;
+    int hole[4];
+    App_SelfHole(a, hole);
+
+    if (hole[2] <= 0 || hole[3] <= 0) {
+        out[0] = (XRectangle){ 0, 0, (unsigned short)w, (unsigned short)h };
+        return 1;
+    }
+
+    const short hx0 = (short)hole[0];
+    const short hy0 = (short)hole[1];
+    const short hx1 = (short)(hole[0] + hole[2]);
+    const short hy1 = (short)(hole[1] + hole[3]);
+    int n = 0;
+    if (hy0 > 0) {
+        out[n++] = (XRectangle){ 0, 0, (unsigned short)w, (unsigned short)hy0 };
+    }
+    if (hy1 < h) {
+        out[n++] = (XRectangle){ 0, hy1, (unsigned short)w, (unsigned short)(h - hy1) };
+    }
+    if (hx0 > 0) {
+        out[n++] = (XRectangle){ 0, hy0, (unsigned short)hx0, (unsigned short)hole[3] };
+    }
+    if (hx1 < w) {
+        out[n++] = (XRectangle){ hx1, hy0, (unsigned short)(w - hx1), (unsigned short)hole[3] };
+    }
+    return n;
+}
+
+// An empty input shape is what makes the window transparent to the pointer: clicks, drags and
+// focus reach whatever is underneath.  Restoring a region needs the current size, because an
+// input shape does not follow the window geometry.
 static void App_ApplyClickThrough(App *a)
 {
     if (!a->shape || !a->win) {
@@ -730,8 +883,65 @@ static void App_ApplyClickThrough(App *a)
     }
     if (g_params.ClickThrough) {
         XShape_SetEmptyInput(a->shape, a->dpy, a->win);
-    } else {
-        XShape_SetFullInput(a->shape, a->dpy, a->win, a->width, a->height);
+        return;
+    }
+    // Otherwise the clickable region tracks what is painted, so the self-capture hole stays
+    // transparent to the pointer as well as to the eye.
+    XRectangle region[4];
+    const int count = App_WindowRegion(a, region);
+    XShape_SetInput(a->shape, a->dpy, a->win, region, count);
+}
+
+// Cuts the hole in the bounding shape.  This is the guarantee that makes the feature hold in
+// every mode: however the window ends up placed -- a WM ignoring the request, the user dragging
+// it, fullscreen or borderless where covering the rectangle is unavoidable -- it simply does
+// not paint over the sampled pixels, so the capture cannot contain its own output.  With
+// IgnoreSelf off the region is the whole window and the tunnel comes back, deliberately.
+static void App_ApplySelfShape(App *a)
+{
+    if (!a->shape || !a->win) {
+        return;
+    }
+    XRectangle region[4];
+    const int count = App_WindowRegion(a, region);
+    int hole[4];
+    App_SelfHole(a, hole);
+    Trace("self-shape: window %dx%d -> %d rect(s), hole %d,%d %dx%d", a->width, a->height, count,
+          hole[0], hole[1], hole[2], hole[3]);
+    XShape_SetBounding(a->shape, a->dpy, a->win, region, count);
+    if (!g_params.ClickThrough) {
+        XShape_SetInput(a->shape, a->dpy, a->win, region, count);
+    }
+    a->ignore_self_applied = g_params.IgnoreSelf;
+}
+
+// Insists on the placement App_WindowPlacement asked for, for the first moments after the
+// window appears.  After that the hole covers any overlap, so the user's own move wins.
+static void App_AssertPlacement(App *a)
+{
+    if (a->placement_frames <= 0) {
+        return;
+    }
+    --a->placement_frames;
+    if (a->mode != 0 || a->window_is_override_redirect || !g_params.IgnoreSelf) {
+        return;
+    }
+
+    int want_w = a->windowed_width;
+    int want_h = a->windowed_height;
+    int want_x = 0, want_y = 0;
+    App_WindowPlacement(a, &want_w, &want_h, &want_x, &want_y);
+
+    int rx = 0, ry = 0;
+    Window child = None;
+    if (!XTranslateCoordinates(a->dpy, a->win, a->root, 0, 0, &rx, &ry, &child)) {
+        return;
+    }
+    if (rx != want_x || ry != want_y) {
+        Trace("placement: asking for %d,%d (currently %d,%d)", want_x, want_y, rx, ry);
+        XMoveWindow(a->dpy, a->win, want_x, want_y);
+        a->self_shape_dirty = 1;
+        XFlush(a->dpy);
     }
 }
 
@@ -796,6 +1006,9 @@ static void App_ApplyWindowState(App *a)
         App_GrabHotkey(a, g_params.ClickThrough);
         a->click_through_applied = g_params.ClickThrough;
     }
+    if (a->ignore_self_applied != g_params.IgnoreSelf) {
+        a->self_shape_dirty = 1;
+    }
 }
 
 static void App_SetMode(App *a, int mode)
@@ -807,7 +1020,7 @@ static void App_SetMode(App *a, int mode)
     if (mode == 1) {
         // Fullscreen: the window manager owns geometry.  Without one, fall back to the
         // borderless path, which is what the reference's Fullscreen mode effectively does.
-        if (XGetSelectionOwner(a->dpy, XInternAtom(a->dpy, "_NET_SUPPORTING_WM_CHECK", False)) == None) {
+        if (!App_HasWindowManager(a->dpy, a->root)) {
             fprintf(stderr, "supercrt: no window manager, using borderless fullscreen\n");
             mode = 2;
         }
@@ -1233,6 +1446,7 @@ typedef enum {
     ACTION_FULLSCREEN,
     ACTION_ONTOP,
     ACTION_CLICKTHROUGH,
+    ACTION_IGNORESELF,
     ACTION_VSYNC,
     ACTION_SAVE,
     ACTION_RELOAD,
@@ -1255,6 +1469,7 @@ static const OverlayAction kActions[] = {
     { "Cycle window mode",            ACTION_FULLSCREEN,    "f" },
     { "Toggle always on top",         ACTION_ONTOP,         "a" },
     { "Toggle click-through",         ACTION_CLICKTHROUGH,  "k" },
+    { "Toggle ignore own output",     ACTION_IGNORESELF,     "i" },
     { "Toggle vsync",                 ACTION_VSYNC,         "v" },
     { "Save settings",                ACTION_SAVE,          "s" },
     { "Reload settings from disk",    ACTION_RELOAD,        "l" },
@@ -1330,6 +1545,13 @@ static void RunAction(App *a, ActionKind action)
     case ACTION_CLICKTHROUGH:
         g_params.ClickThrough = !g_params.ClickThrough;
         SetStatus(a, "click-through %s", g_params.ClickThrough ? "on" : "off");
+        a->dirty_settings = 1;
+        break;
+    case ACTION_IGNORESELF:
+        g_params.IgnoreSelf = !g_params.IgnoreSelf;
+        a->self_shape_dirty = 1;
+        SetStatus(a, "ignore own output %s%s", g_params.IgnoreSelf ? "on" : "off",
+                  g_params.IgnoreSelf ? "" : " (the window samples itself again)");
         a->dirty_settings = 1;
         break;
     case ACTION_VSYNC:
@@ -1988,6 +2210,7 @@ static int HandleKey(App *a, XKeyEvent *key)
     case XK_m: RunAction(a, ACTION_OUTLINE); return 1;
     case XK_a: RunAction(a, ACTION_ONTOP); return 1;
     case XK_k: RunAction(a, ACTION_CLICKTHROUGH); return 1;
+    case XK_i: RunAction(a, ACTION_IGNORESELF); return 1;
     case XK_v: RunAction(a, ACTION_VSYNC); return 1;
     case XK_s: RunAction(a, ACTION_SAVE); return 1;
     case XK_l: RunAction(a, ACTION_RELOAD); return 1;
@@ -2001,8 +2224,23 @@ static void HandleEvents(App *a)
     while (XPending(a->dpy)) {
         XEvent ev;
         XNextEvent(a->dpy, &ev);
+
+        // Events already queued for the window a mode change replaced keep arriving after it
+        // has been destroyed, and they carry its geometry; taking them for this window's is
+        // how the borderless size kept reverting.  Root-window events are real -- the
+        // target-area drag selects and grabs on the root.
+        if (ev.xany.window != a->win && ev.xany.window != a->root) {
+            continue;
+        }
+
         switch (ev.type) {
         case ConfigureNotify:
+            // Both shapes are regions in window coordinates, and a *move* leaves them over the
+            // wrong pixels just as much as a resize does: the hole is positioned relative to
+            // the sampled rectangle, which does not move with the window.  So both are
+            // invalidated for either, whether or not the drawable size changed.
+            a->self_shape_dirty = 1;
+            a->click_through_applied = -1;
             if (ev.xconfigure.width != a->width || ev.xconfigure.height != a->height) {
                 a->width = ev.xconfigure.width > 0 ? ev.xconfigure.width : 1;
                 a->height = ev.xconfigure.height > 0 ? ev.xconfigure.height : 1;
@@ -2011,9 +2249,6 @@ static void HandleEvents(App *a)
                     a->windowed_height = a->height;
                 }
                 App_CreateTargets(a);
-                // The input shape is a region in window coordinates, so a resize leaves it
-                // covering the wrong area: force the next apply.
-                a->click_through_applied = -1;
             }
             break;
         case Expose:
@@ -2091,7 +2326,9 @@ static void Usage(const char *argv0)
         "In the overlay: Up/Down select, Left/Right adjust (Shift coarse), Enter run\n"
         "action, c/t/b set the capture region from the mouse, e drag target area, s save,\n"
         "l reload, r defaults, m outline, f window mode, a always-on-top, k click-through,\n"
-        "v vsync, q quit.\n"
+        "i ignore own output, v vsync, q quit.\n"
+        "The viewer never samples its own output: it keeps clear of the sampled rectangle and\n"
+        "punches a hole in itself wherever it would overlap, so no recursion and no feedback.\n"
         "Click-through makes the window ignore the pointer, so windows behind it can be driven\n"
         "while the viewer stays up.  Ctrl+Alt+C releases it from anywhere, k releases it when\n"
         "the window has the keyboard.\n",
@@ -2507,9 +2744,18 @@ int main(int argc, char **argv)
                   g_params.SrcHeight);
             Marker_SetRect(app.marker, g_params.SrcX, g_params.SrcY, g_params.SrcWidth, g_params.SrcHeight);
             RegionRemember(last_region, &g_params);
+            app.self_shape_dirty = 1; // the hole follows the sampled rectangle
         }
         // Always-on-top and click-through, pushed only when the value changed.
         App_ApplyWindowState(&app);
+        // Placement is asked for repeatedly for the first moment, then left alone.
+        App_AssertPlacement(&app);
+        // The self-capture hole is re-cut only when the geometry or the sampled rectangle
+        // moved, since both are round trips to the server.
+        if (app.self_shape_dirty) {
+            App_ApplySelfShape(&app);
+            app.self_shape_dirty = 0;
+        }
         // Borderless mode has no window manager to honour _NET_WM_STATE_ABOVE, so it keeps
         // itself in front directly.  Every other mode leaves it to the WM, which is what
         // lets a window behind be focused and driven without the viewer dropping behind.
