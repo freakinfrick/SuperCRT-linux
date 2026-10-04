@@ -144,6 +144,7 @@ typedef struct { float x, y, w, h; } Rectf;
 // Set SUPERCRT_TRACE=1 to log pointer input and mode transitions; useful when a remote or
 // grabbed pointer behaves differently from a local one.
 static int g_trace = -1;
+static int g_no_hud;     // --no-hud: no bottom strip (streaming); overlay and edit mode still draw
 
 static void Trace(const char *fmt, ...)
 {
@@ -246,7 +247,6 @@ typedef struct {
     Rectf overlay_track;        // scrollbar track and thumb; empty when the whole list fits
     Rectf overlay_thumb;
     int overlay_thumb_drag;
-    int capture_outline_enabled;
     int on_top_applied;          // last value pushed to the WM, -1 to force a re-apply
     int click_through_applied;   // likewise for the input shape
     int hotkey_grabbed;
@@ -815,6 +815,28 @@ static void App_SetOnTop(App *a, int on)
 // Not sampling ourselves
 // ---------------------------------------------------------------------------
 
+// The toplevel ancestor of `win` under the root: a client is usually reparented into a frame, and
+// skipping only the client would leave the frame -- holding the client's pixels -- in the stack.
+static Window App_ToplevelUnder(Display *dpy, Window root, Window win)
+{
+    Window cur = win;
+    for (int guard = 0; guard < 32; ++guard) {
+        Window r = None, parent = None, *kids = NULL;
+        unsigned int n = 0;
+        if (!XQueryTree(dpy, cur, &r, &parent, &kids, &n)) {
+            break;
+        }
+        if (kids) {
+            XFree(kids);
+        }
+        if (parent == None || parent == r || parent == root) {
+            break;
+        }
+        cur = parent;
+    }
+    return cur;
+}
+
 // The part of the sampled rectangle this window covers, in **root coordinates**: what the
 // capture has to get from somewhere other than the screen, because the viewer's own output must
 // never appear in it.  Returns 0 when they do not overlap.
@@ -828,9 +850,17 @@ static int App_SourceCoverage(App *a, int out[4])
     if (!g_params.IgnoreSelf || !a->win) {
         return 0;
     }
+
+    // The window's toplevel, not the client: the environment's title bar and border are this
+    // window's output too and they sit outside the client rectangle, so a footprint measured on
+    // the client leaves them in the sample.  Without a window manager the toplevel is the window
+    // itself and this is the client rectangle again.
+    const Window top = App_ToplevelUnder(a->dpy, a->root, a->win);
+    XWindowAttributes attrs;
     int rx = 0, ry = 0;
     Window child = None;
-    if (!XTranslateCoordinates(a->dpy, a->win, a->root, 0, 0, &rx, &ry, &child)) {
+    if (!XGetWindowAttributes(a->dpy, top, &attrs) ||
+        !XTranslateCoordinates(a->dpy, top, a->root, 0, 0, &rx, &ry, &child)) {
         return 0;
     }
 
@@ -838,8 +868,8 @@ static int App_SourceCoverage(App *a, int out[4])
     const int sy1 = g_params.SrcY + g_params.SrcHeight;
     const int hx0 = g_params.SrcX > rx ? g_params.SrcX : rx;
     const int hy0 = g_params.SrcY > ry ? g_params.SrcY : ry;
-    const int hx1 = sx1 < rx + a->width ? sx1 : rx + a->width;
-    const int hy1 = sy1 < ry + a->height ? sy1 : ry + a->height;
+    const int hx1 = sx1 < rx + attrs.width ? sx1 : rx + attrs.width;
+    const int hy1 = sy1 < ry + attrs.height ? sy1 : ry + attrs.height;
     if (hx1 <= hx0 || hy1 <= hy0) {
         return 0;
     }
@@ -965,10 +995,6 @@ static void App_ApplyWindowState(App *a)
 
 static void App_SetMode(App *a, int mode)
 {
-    if (mode == a->mode && a->win) {
-        return;
-    }
-
     if (mode == 1) {
         // Fullscreen: the window manager owns geometry.  Without one, fall back to the
         // borderless path, which is what the reference's Fullscreen mode effectively does.
@@ -976,6 +1002,14 @@ static void App_SetMode(App *a, int mode)
             fprintf(stderr, "supercrt: no window manager, using borderless fullscreen\n");
             mode = 2;
         }
+    }
+
+    // Kept in step with the config, after the fallback above and before the early return, so
+    // the mode the row shows is the mode a save writes.
+    g_params.Fullscreen = mode;
+
+    if (mode == a->mode && a->win) {
+        return;
     }
 
     a->mode = mode;
@@ -1135,28 +1169,6 @@ static void App_UploadRootGrab(App *a, const CaptureRegion *region, const int sk
     }
 }
 
-// The toplevel ancestor of `win` under the root: a client is usually reparented into a frame, and
-// skipping only the client would leave the frame -- holding the client's pixels -- in the stack.
-static Window App_ToplevelUnder(Display *dpy, Window root, Window win)
-{
-    Window cur = win;
-    for (int guard = 0; guard < 32; ++guard) {
-        Window r = None, parent = None, *kids = NULL;
-        unsigned int n = 0;
-        if (!XQueryTree(dpy, cur, &r, &parent, &kids, &n)) {
-            break;
-        }
-        if (kids) {
-            XFree(kids);
-        }
-        if (parent == None || parent == r || parent == root) {
-            break;
-        }
-        cur = parent;
-    }
-    return cur;
-}
-
 // Re-reads the covered footprint from the other windows in the stack, bottom to top: the last one
 // written is the topmost, which is what is on screen there once this window is discounted.  A
 // window below that is itself covered is corrected by whatever covers it in the same pass, so the
@@ -1170,11 +1182,18 @@ static void App_GrabBeneath(App *a, const int cover[4])
         return;
     }
 
+    // This window's own toplevel is in the stack, and so is the capture outline: an
+    // override-redirect window of the app's that encloses the sampled rectangle and sits above
+    // everything, kept out of sight by its shape alone.  Its pixmap is the frame it painted with
+    // black everywhere else, which is what would otherwise be stamped over the whole footprint.
+    // Skipping it takes nothing away: it paints outside the sampled rectangle by construction,
+    // so all of it that can overlap the footprint is shape, not pixels.
     const Window mine = App_ToplevelUnder(a->dpy, a->root, a->win);
+    const Window outline = a->marker ? Marker_Window(a->marker) : None;
     int pieces = 0;
     for (unsigned int i = 0; i < count; ++i) {
         const Window w = children[i];
-        if (w == mine) {
+        if (w == mine || w == outline) {
             continue;
         }
         XWindowAttributes attrs;
@@ -1249,9 +1268,14 @@ static void App_GrabSource(App *a)
         // paint over it.  (A patch of desktop with no window under it therefore reads black
         // rather than as wallpaper: a window's pixels cannot be asked for when they are not on
         // screen, and the desktop's are only readable through one.)
+        //
+        // The scissor is in texture rows, and the uploads put source row r at texture row r, so
+        // the rows to clear are the ones App_UploadRootGrab left alone.  Reaching for the height
+        // here -- as if texture row 0 were the bottom of the source -- laid the black box on the
+        // far side of the sampled rectangle instead, a mirror of the window's own footprint.
         glBindFramebuffer(GL_FRAMEBUFFER, a->clear_fbo);
         glEnable(GL_SCISSOR_TEST);
-        glScissor(skip[0], g_params.SrcHeight - (skip[1] + skip[3]), skip[2], skip[3]);
+        glScissor(skip[0], skip[1], skip[2], skip[3]);
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
@@ -1596,28 +1620,46 @@ typedef enum {
     ACTION_QUIT,
 } ActionKind;
 
+// A row that is a *setting* rather than a command: it shows which way it is set and is driven
+// like everything else in the list -- click, Enter, Left/Right -- instead of only by its one
+// shortcut key.  The kind names the state, and every read goes back to the same state the
+// renderer acts on, so a row cannot show one thing while the sim does another.
+typedef enum {
+    TOGGLE_NONE = 0,
+    TOGGLE_OUTLINE,
+    TOGGLE_MODE,            // three values: windowed, fullscreen, borderless
+    TOGGLE_ONTOP,
+    TOGGLE_CLICKTHROUGH,
+    TOGGLE_IGNORESELF,
+    TOGGLE_VSYNC,
+} ToggleKind;
+
 typedef struct {
     const char *label;
     ActionKind action;
     const char *hint;
+    ToggleKind toggle;      // TOGGLE_NONE for a plain command
 } OverlayAction;
 
 static const OverlayAction kActions[] = {
-    { "Drag target area with mouse",  ACTION_EDIT_TARGET,   "e" },
-    { "Center capture on cursor",     ACTION_CENTER,        "c" },
-    { "Set capture top-left",         ACTION_TOP_LEFT,      "t" },
-    { "Set capture bottom-right",     ACTION_BOTTOM_RIGHT,  "b" },
-    { "Toggle capture outline",       ACTION_OUTLINE,       "m" },
-    { "Cycle window mode",            ACTION_FULLSCREEN,    "f" },
-    { "Toggle always on top",         ACTION_ONTOP,         "a" },
-    { "Toggle click-through",         ACTION_CLICKTHROUGH,  "k" },
-    { "Toggle ignore own output",     ACTION_IGNORESELF,     "i" },
-    { "Toggle vsync",                 ACTION_VSYNC,         "v" },
-    { "Save settings",                ACTION_SAVE,          "s" },
-    { "Reload settings from disk",    ACTION_RELOAD,        "l" },
-    { "Restore defaults",             ACTION_DEFAULTS,      "r" },
-    { "Quit",                         ACTION_QUIT,          "q" },
+    { "Drag target area with mouse",  ACTION_EDIT_TARGET,   "e", TOGGLE_NONE },
+    { "Center capture on cursor",     ACTION_CENTER,        "c", TOGGLE_NONE },
+    { "Set capture top-left",         ACTION_TOP_LEFT,      "t", TOGGLE_NONE },
+    { "Set capture bottom-right",     ACTION_BOTTOM_RIGHT,  "b", TOGGLE_NONE },
+    { "Capture outline",              ACTION_OUTLINE,       "m", TOGGLE_OUTLINE },
+    { "Window mode",                  ACTION_FULLSCREEN,    "f", TOGGLE_MODE },
+    { "Always on top",                ACTION_ONTOP,         "a", TOGGLE_ONTOP },
+    { "Click-through",                ACTION_CLICKTHROUGH,  "k", TOGGLE_CLICKTHROUGH },
+    { "Ignore own output",            ACTION_IGNORESELF,    "i", TOGGLE_IGNORESELF },
+    { "VSync",                        ACTION_VSYNC,         "v", TOGGLE_VSYNC },
+    { "Save settings",                ACTION_SAVE,          "s", TOGGLE_NONE },
+    { "Reload settings from disk",    ACTION_RELOAD,        "l", TOGGLE_NONE },
+    { "Restore defaults",             ACTION_DEFAULTS,      "r", TOGGLE_NONE },
+    { "Quit",                         ACTION_QUIT,          "q", TOGGLE_NONE },
 };
+
+// Indexed by the window mode's value, which is what the row displays and what App_SetMode takes.
+static const char *const kModeNames[3] = { "windowed", "fullscreen", "borderless" };
 
 static void SetStatus(App *a, const char *fmt, ...)
 {
@@ -1626,6 +1668,119 @@ static void SetStatus(App *a, const char *fmt, ...)
     vsnprintf(a->status, sizeof(a->status), fmt, args);
     va_end(args);
     a->status_frames = 240;
+}
+
+// The value a toggle row is showing, or -1 when the row is a plain command.  Read back from
+// the state the program actually acts on: g_params for the flags (which App_ApplyWindowState
+// pushes to the window every frame) and a->mode for the window mode, which is the copy the
+// geometry and the WM messages follow.
+static int Action_ToggleValue(const App *a, ToggleKind kind)
+{
+    switch (kind) {
+    case TOGGLE_OUTLINE:      return g_params.CaptureOutline ? 1 : 0;
+    case TOGGLE_MODE:         return a->mode;
+    case TOGGLE_ONTOP:        return g_params.AlwaysOnTop ? 1 : 0;
+    case TOGGLE_CLICKTHROUGH: return g_params.ClickThrough ? 1 : 0;
+    case TOGGLE_IGNORESELF:   return g_params.IgnoreSelf ? 1 : 0;
+    case TOGGLE_VSYNC:        return g_params.VSync ? 1 : 0;
+    case TOGGLE_NONE:
+    default:                  return -1;
+    }
+}
+
+// Highest value a toggle holds: the mode has three, everything else is on/off.  This is what
+// Left/Right and Home/End clamp to.
+static int Action_ToggleMax(ToggleKind kind)
+{
+    return kind == TOGGLE_MODE ? 2 : 1;
+}
+
+// Pushes a toggle's current value into whatever it drives.  Idempotent and silent, so a
+// reload can re-apply the lot and still report once: a reloaded config that changed a setting
+// has to reach the window, or the row would show a value the sim is not in.
+static void Action_ToggleApply(App *a, ToggleKind kind)
+{
+    switch (kind) {
+    case TOGGLE_OUTLINE:
+        Marker_SetEnabled(a->marker, g_params.CaptureOutline);
+        break;
+    case TOGGLE_MODE:
+        // App_SetMode writes g_params.Fullscreen back, and downgrades to borderless when no
+        // window manager is running, so the row shows the mode that is really in force.
+        App_SetMode(a, g_params.Fullscreen);
+        break;
+    case TOGGLE_VSYNC:
+        a->swap_control = App_ApplySwapInterval(a, g_params.VSync ? 1 : 0);
+        break;
+    default:
+        // AlwaysOnTop and ClickThrough are reconciled from g_params every frame by
+        // App_ApplyWindowState; there is nothing to push here.
+        break;
+    }
+}
+
+static void Action_ToggleApplyAll(App *a)
+{
+    Action_ToggleApply(a, TOGGLE_MODE);
+    Action_ToggleApply(a, TOGGLE_OUTLINE);
+    Action_ToggleApply(a, TOGGLE_VSYNC);
+}
+
+// Sets a toggle outright.  Every way in -- a shortcut key, a click, Enter, Left/Right -- ends
+// up here, so the row and the key can never leave the setting in different states.
+static void Action_ToggleSet(App *a, ToggleKind kind, int value)
+{
+    if (value < 0) {
+        value = 0;
+    }
+    if (value > Action_ToggleMax(kind)) {
+        value = Action_ToggleMax(kind);
+    }
+    if (Action_ToggleValue(a, kind) == value) {
+        return;   // already there: keeps Left/Right at the ends from dirtying the config
+    }
+
+    switch (kind) {
+    case TOGGLE_OUTLINE:
+        g_params.CaptureOutline = value;
+        Action_ToggleApply(a, kind);
+        SetStatus(a, "capture outline %s", value ? "on" : "off");
+        break;
+    case TOGGLE_MODE:
+        App_SetMode(a, value);   // also writes g_params.Fullscreen
+        SetStatus(a, "window mode: %s", kModeNames[value]);
+        break;
+    case TOGGLE_ONTOP:
+        g_params.AlwaysOnTop = value;
+        SetStatus(a, "always on top %s", value ? "on" : "off");
+        break;
+    case TOGGLE_CLICKTHROUGH:
+        g_params.ClickThrough = value;
+        SetStatus(a, "click-through %s", value ? "on" : "off");
+        break;
+    case TOGGLE_IGNORESELF:
+        g_params.IgnoreSelf = value;
+        SetStatus(a, "ignore own output %s%s", value ? "on" : "off",
+                  value ? "" : " (the window samples itself again)");
+        break;
+    case TOGGLE_VSYNC:
+        g_params.VSync = value;
+        Action_ToggleApply(a, kind);
+        SetStatus(a, "vsync %s%s", value ? "on" : "off",
+                  a->swap_control ? "" : " (software-paced)");
+        break;
+    default:
+        return;
+    }
+    a->dirty_settings = 1;
+}
+
+// The shortcut keys and a click on the row both flip what they name; the mode has three
+// values and cycles through them, which is what "Cycle window mode" has always meant.
+static void Action_ToggleFlip(App *a, ToggleKind kind)
+{
+    const int value = Action_ToggleValue(a, kind);
+    Action_ToggleSet(a, kind, kind == TOGGLE_MODE ? (value + 1) % 3 : !value);
 }
 
 static void Overlay_RowCount(int *tunable_count, int *action_count)
@@ -1790,36 +1945,22 @@ static void RunAction(App *a, ActionKind action)
         break;
     }
     case ACTION_OUTLINE:
-        a->capture_outline_enabled = !a->capture_outline_enabled;
-        Marker_SetEnabled(a->marker, a->capture_outline_enabled);
-        SetStatus(a, "capture outline %s", a->capture_outline_enabled ? "on" : "off");
+        Action_ToggleFlip(a, TOGGLE_OUTLINE);
         break;
     case ACTION_FULLSCREEN:
-        App_SetMode(a, (a->mode + 1) % 3);
-        SetStatus(a, "window mode: %s", a->mode == 0 ? "windowed" : (a->mode == 1 ? "fullscreen" : "borderless"));
+        Action_ToggleFlip(a, TOGGLE_MODE);
         break;
     case ACTION_ONTOP:
-        g_params.AlwaysOnTop = !g_params.AlwaysOnTop;
-        SetStatus(a, "always on top %s", g_params.AlwaysOnTop ? "on" : "off");
-        a->dirty_settings = 1;
+        Action_ToggleFlip(a, TOGGLE_ONTOP);
         break;
     case ACTION_CLICKTHROUGH:
-        g_params.ClickThrough = !g_params.ClickThrough;
-        SetStatus(a, "click-through %s", g_params.ClickThrough ? "on" : "off");
-        a->dirty_settings = 1;
+        Action_ToggleFlip(a, TOGGLE_CLICKTHROUGH);
         break;
     case ACTION_IGNORESELF:
-        g_params.IgnoreSelf = !g_params.IgnoreSelf;
-        SetStatus(a, "ignore own output %s%s", g_params.IgnoreSelf ? "on" : "off",
-                  g_params.IgnoreSelf ? "" : " (the window samples itself again)");
-        a->dirty_settings = 1;
+        Action_ToggleFlip(a, TOGGLE_IGNORESELF);
         break;
     case ACTION_VSYNC:
-        g_params.VSync = !g_params.VSync;
-        a->swap_control = App_ApplySwapInterval(a, g_params.VSync ? 1 : 0);
-        SetStatus(a, "vsync %s%s", g_params.VSync ? "on" : "off",
-                  a->swap_control ? "" : " (software-paced)");
-        a->dirty_settings = 1;
+        Action_ToggleFlip(a, TOGGLE_VSYNC);
         break;
     case ACTION_SAVE:
         if (Params_Save(&g_params, a->config_path) == 0) {
@@ -1831,11 +1972,12 @@ static void RunAction(App *a, ActionKind action)
         break;
     case ACTION_RELOAD:
         Params_Load(&g_params, a->config_path);
-        a->swap_control = App_ApplySwapInterval(a, g_params.VSync ? 1 : 0);
+        Action_ToggleApplyAll(a);
         SetStatus(a, "reloaded %s", a->config_path);
         break;
     case ACTION_DEFAULTS:
         Params_Defaults(&g_params);
+        Action_ToggleApplyAll(a);
         SetStatus(a, "defaults restored (not saved)");
         a->dirty_settings = 1;
         break;
@@ -1845,6 +1987,103 @@ static void RunAction(App *a, ActionKind action)
     default:
         break;
     }
+}
+
+// One settings row: shortcut key, label, then a control showing which way the setting is set
+// -- a switch for the on/off ones, a three-cell gauge for the window mode, which is a position
+// rather than an on/off.  Laid out from measured widths, right to left, so a narrow card cuts
+// the label instead of running the control off the edge or drawing the two through each other.
+static void Overlay_DrawToggleRow(UI *ui, const OverlayAction *action, int value, float x,
+                                  float y, float width)
+{
+    const float line = UI_LineHeight();
+    const int is_mode = (action->toggle == TOGGLE_MODE);
+    const float gap = 8.0f;
+    const float control_w = 46.0f;
+
+    // Width the state text is given: the widest string this control column has to hold, so
+    // every state in the section ends at the same place.
+    float state_slot = UI_TextWidth("Off");
+    if (is_mode) {
+        for (int i = 0; i < 3; ++i) {
+            const float w = UI_TextWidth(kModeNames[i]);
+            if (w > state_slot) {
+                state_slot = w;
+            }
+        }
+    }
+
+    const float control_x = x + width - control_w;
+    const float state_x = control_x - gap - state_slot;
+
+    char hint[16];
+    snprintf(hint, sizeof(hint), "[%s]", action->hint);
+    float hint_w = UI_TextWidth(hint);
+
+    // The key goes before the label is cut: the label is what says which setting this is.
+    float label_room = state_x - gap - (x + hint_w + gap);
+    if (label_room < UI_TextWidth(action->label)) {
+        hint_w = 0.0f;
+        label_room = state_x - gap - x;
+    }
+    if (label_room < 0.0f) {
+        label_room = 0.0f;
+    }
+
+    const float label_x = x + (hint_w > 0.0f ? hint_w + gap : 0.0f);
+    char label[192];
+    ElideEnd(label, sizeof(label), action->label, label_room);
+    if (hint_w > 0.0f) {
+        UI_Text(ui, x, y, 0.45f, 0.50f, 0.58f, 1.0f, hint);
+    }
+    UI_Text(ui, label_x, y, 0.6f, 0.9f, 0.7f, 1.0f, label);
+
+    // The control itself, on the row's vertical centre line.
+    const float center_y = y + line * 0.5f;
+    if (!is_mode) {
+        const float track_h = 11.0f;
+        const float track_y = center_y - track_h * 0.5f;
+        const float knob = track_h - 3.0f;
+        if (value) {
+            UI_Rect(ui, control_x, track_y, control_w, track_h, 0.16f, 0.55f, 0.34f, 1.0f);
+            UI_Rect(ui, control_x + control_w - knob - 1.5f, track_y + 1.5f, knob, knob,
+                    0.82f, 1.0f, 0.86f, 1.0f);
+        } else {
+            UI_Rect(ui, control_x, track_y, control_w, track_h, 0.20f, 0.22f, 0.28f, 1.0f);
+            UI_Rect(ui, control_x + 1.5f, track_y + 1.5f, knob, knob, 0.52f, 0.55f, 0.62f, 1.0f);
+        }
+    } else {
+        const float cell_w = (control_w - 4.0f) / 3.0f;
+        const float cell_h = 11.0f;
+        const float cell_y = center_y - cell_h * 0.5f;
+        for (int i = 0; i < 3; ++i) {
+            const float cell_x = control_x + (float)i * (cell_w + 2.0f);
+            if (i == value) {
+                UI_Rect(ui, cell_x, cell_y, cell_w, cell_h, 0.35f, 0.72f, 0.95f, 1.0f);
+            } else {
+                UI_Rect(ui, cell_x, cell_y, cell_w, cell_h, 0.20f, 0.22f, 0.28f, 1.0f);
+            }
+        }
+    }
+
+    // And the state in words, because a switch says which way it is only to someone who
+    // already knows the convention: green is on, dim is off, and the mode is named.
+    char state[24];
+    float sr = 0.55f, sg = 0.58f, sb = 0.66f;
+    if (is_mode) {
+        snprintf(state, sizeof(state), "%s", kModeNames[value]);
+        sr = 0.78f;
+        sg = 0.83f;
+        sb = 0.92f;
+    } else {
+        snprintf(state, sizeof(state), "%s", value ? "On" : "Off");
+        if (value) {
+            sr = 0.55f;
+            sg = 0.95f;
+            sb = 0.65f;
+        }
+    }
+    UI_Text(ui, state_x + state_slot - UI_TextWidth(state), y, sr, sg, sb, 1.0f, state);
 }
 
 static void Overlay_Draw(App *a)
@@ -2063,9 +2302,14 @@ static void Overlay_Draw(App *a)
             }
         } else {
             const OverlayAction *action = &kActions[flat - tunable_count];
-            snprintf(text, sizeof(text), "[%s] %s", action->hint, action->label);
-            ElideEnd(text, sizeof(text), text, content_w);
-            UI_Text(ui, rows_x, row_y, 0.6f, 0.9f, 0.7f, 1.0f, text);
+            const int value = Action_ToggleValue(a, action->toggle);
+            if (value < 0) {
+                snprintf(text, sizeof(text), "[%s] %s", action->hint, action->label);
+                ElideEnd(text, sizeof(text), text, content_w);
+                UI_Text(ui, rows_x, row_y, 0.6f, 0.9f, 0.7f, 1.0f, text);
+            } else {
+                Overlay_DrawToggleRow(ui, action, value, rows_x, row_y, content_w);
+            }
             if (hit) {
                 hit->is_action = 1;
             }
@@ -2131,6 +2375,9 @@ static void Hud_Draw(App *a)
     if (a->overlay_open || (!a->pointer_inside && !a->edit_mode && !g_params.ClickThrough)) {
         return;
     }
+    if (g_no_hud && !a->edit_mode) {
+        return;
+    }
 
     const float bar_h = 30.0f;
     const float y = (float)a->height - bar_h;
@@ -2177,6 +2424,22 @@ static void Overlay_Adjust(App *a, int direction, int coarse)
     int tunable_count = 0, action_count = 0;
     Overlay_RowCount(&tunable_count, &action_count);
     if (a->overlay_selected >= tunable_count) {
+        // An action row has nothing to adjust unless it is a setting, and then left/right is
+        // the off/on pair -- the previous/next mode for the window mode, which is a cycle.
+        // Home/End overshoot and clamp, which is what makes them this row's min and max too.
+        const OverlayAction *action = &kActions[a->overlay_selected - tunable_count];
+        if (action->toggle == TOGGLE_NONE) {
+            return;
+        }
+        const int max = Action_ToggleMax(action->toggle);
+        int value = Action_ToggleValue(a, action->toggle) + (direction > 0 ? 1 : -1);
+        if (value < 0) {
+            value = 0;
+        }
+        if (value > max) {
+            value = max;
+        }
+        Action_ToggleSet(a, action->toggle, value);
         return;
     }
 
@@ -2263,7 +2526,7 @@ static void EditMode_Leave(App *a)
     XUngrabPointer(a->dpy, CurrentTime);
     XSelectInput(a->dpy, a->root, 0);
     Marker_SetInteractive(a->marker, 0);
-    Marker_SetEnabled(a->marker, a->capture_outline_enabled);
+    Marker_SetEnabled(a->marker, g_params.CaptureOutline);
     SetStatus(a, "target area %d,%d %dx%d", g_params.SrcX, g_params.SrcY, g_params.SrcWidth,
               g_params.SrcHeight);
 }
@@ -2760,6 +3023,7 @@ static void Usage(const char *argv0)
         "  --fullscreen         start fullscreen via the window manager\n"
         "  --borderless         start as a borderless window covering the screen\n"
         "  --no-outline         hide the capture-region outline\n"
+        "  --no-hud             hide the bottom status strip (e.g. when streaming the output)\n"
         "  --no-vsync           pace frames in software instead of waiting for vblank\n"
         "  --no-shm             force the XGetImage capture path (no MIT-SHM)\n"
         "  --pattern            use a built-in test pattern instead of the desktop\n"
@@ -2848,6 +3112,8 @@ int main(int argc, char **argv)
             force_mode = 2;
         } else if (!strcmp(arg, "--no-outline")) {
             g_params.CaptureOutline = 0;
+        } else if (!strcmp(arg, "--no-hud")) {
+            g_no_hud = 1;
         } else if (!strcmp(arg, "--no-vsync")) {
             g_params.VSync = 0;
         } else if (!strcmp(arg, "--pattern")) {
@@ -3032,7 +3298,6 @@ int main(int argc, char **argv)
     glGenFramebuffers(1, &app.clear_fbo);
     app.even_frame = 1;
     app.slider_row = -1;   // no value is being dragged until a press says otherwise
-    app.capture_outline_enabled = g_params.CaptureOutline;
     app.overlay_selected = 0;
 
     App_CreateCleanTexture(&app);
@@ -3064,7 +3329,7 @@ int main(int argc, char **argv)
     }
     app.using_shm = Capture_UsesShm(app.capture);
     app.marker = Marker_Create(app.dpy, app.screen);
-    Marker_SetEnabled(app.marker, app.capture_outline_enabled);
+    Marker_SetEnabled(app.marker, g_params.CaptureOutline);
     Marker_SetRect(app.marker, g_params.SrcX, g_params.SrcY, g_params.SrcWidth, g_params.SrcHeight);
 
     if (use_pattern) {

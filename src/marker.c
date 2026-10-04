@@ -83,6 +83,8 @@ void Marker_Destroy(Marker *m)
 
 int Marker_IsSupported(const Marker *m) { return m->supported; }
 
+Window Marker_Window(const Marker *m) { return m ? m->win : None; }
+
 // A ring of four strips hugging the sampled rectangle from the outside, `t` pixels thick.
 // Never overlaps the rectangle itself, so nothing the marker paints can be captured.
 static void Marker_Ring(const Marker *m, short t, XRectangle out[4])

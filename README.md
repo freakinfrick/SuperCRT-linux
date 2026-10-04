@@ -78,6 +78,7 @@ Assets are searched for as `assets/*` beside the binary, then `../assets`,
 | `--dst W,H` | Output window size |
 | `--fullscreen` / `--borderless` | Start fullscreen (via WM) or as a borderless screen-sized window |
 | `--no-outline` | Hide the capture-region outline |
+| `--no-hud` | Hide the bottom status strip, e.g. when the output is being streamed |
 | `--no-vsync` | Pace frames in software instead of waiting for vblank |
 | `--no-shm` | Force the `XGetImage` capture path |
 | `--pattern` | Built-in test pattern instead of the desktop |
@@ -98,6 +99,13 @@ Assets are searched for as `assets/*` beside the binary, then `../assets`,
   `a` always-on-top, `k` click-through, `i` ignore own output, `v` vsync, `s` save,
   `l` reload, `r` defaults, `q` quit. These all need the overlay open, which is why
   click-through also has a global chord: **Ctrl+Alt+C**.
+- The six settings that are **switches** are rows with a control on the right, not just
+  commands: capture outline, window mode, always-on-top, click-through, ignore-own-output and
+  vsync each draw a switch with `On`/`Off` beside it, or — for the mode, which is not an
+  on/off at all — a three-cell gauge and the name of the mode in force. They read that state
+  back from the same value the renderer acts on, so a row cannot show one thing while the sim
+  does another, and they are set the same three ways as everything else in the list: **click**
+  the row, press **Enter**, or use **Left/Right** (the mode cycles; **Home/End** are off/on).
 - The overlay is a **translucent card floating over the sim**, not a screen-filling panel:
   the CRT keeps playing around and through it while you tune, which is the point of tuning
   over a live image. The card scales with the window (capped at 480px wide and ~62% tall)
@@ -162,7 +170,12 @@ fullscreen included.
   of the rectangle the viewer covers is re-read from the windows below it, through XComposite: the
   viewer's footprint is replaced by what is actually behind it, topmost window last. Those pixels
   are what the screen shows there once the viewer is discounted, so the sampled image is right no
-  matter where the window sits.
+  matter where the window sits. The footprint is the viewer's **toplevel** — the frame the window
+  manager hangs the window on, title bar and border included — and not the client rectangle the
+  app knows its own size from, because the environment draws those decorations outside that
+  rectangle and a footprint measured on the client leaves them in the sample. The capture outline
+  is one of the app's own windows as well, so it is skipped in the same pass wherever it sits in
+  the stack, rather than being read back as if it were part of the desktop.
 
 Two things worth knowing. Reading a window's own pixels requires the Composite extension, which
 is `dlopen`ed at runtime like libXext — without it, nothing is read from below and the footprint

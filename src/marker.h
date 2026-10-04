@@ -27,6 +27,10 @@ void Marker_Raise(Marker *m);
 // Redraws the frame; call when handling an Expose event.
 void Marker_Redraw(Marker *m);
 int Marker_IsSupported(const Marker *m);
+// The override-redirect window the frame is drawn in, or None.  It is the app's own output just
+// as the sim window is, so anything that compares windows against what is really on the desktop
+// -- the grab of the windows under the viewer -- has to know it.
+Window Marker_Window(const Marker *m);
 
 // Window geometry the marker wants for a region, exposed for tests/tools.
 void Marker_WindowRect(int x, int y, int width, int height, int *out_x, int *out_y, int *out_w,
