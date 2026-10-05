@@ -10,7 +10,9 @@
 // D3D9 -> OpenGL mapping notes are inline where the two APIs disagree (texture
 // orientation, cull winding, half-pixel offsets, per-sampler filter states).
 
+#include <dlfcn.h>
 #include <math.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -145,6 +147,7 @@ typedef struct { float x, y, w, h; } Rectf;
 // grabbed pointer behaves differently from a local one.
 static int g_trace = -1;
 static int g_no_hud;     // --no-hud: no bottom strip (streaming); overlay and edit mode still draw
+static int g_sync_damage; // --sync-damage: grab when the window beneath changes, not on a timer
 
 static void Trace(const char *fmt, ...)
 {
@@ -211,6 +214,21 @@ typedef struct {
     int window_is_override_redirect;
     int screen_width, screen_height;
     int using_shm;
+
+    // --sync-damage.  The free-running 60 Hz loop grabbed whenever its own clock said so, so a
+    // finished frame of the window beneath waited up to a whole period before being read.  With
+    // XDamage on each window read through App_GrabBeneath, the loop instead sleeps until one of
+    // them reports new pixels, then grabs at once.  libXdamage is dlopen'd like Xext/Xcomposite.
+    int sync_damage;
+    int damage_event_base;
+    unsigned long (*pDamageCreate)(Display *, Drawable, int);
+    void (*pDamageDestroy)(Display *, unsigned long);
+    void (*pDamageSubtract)(Display *, unsigned long, unsigned long, unsigned long);
+    Window damage_win[16];
+    unsigned long damage_id[16];
+    unsigned char damage_seen[16];
+    int damage_count;
+    int damaged;
     int swap_control;   // driver-honoured vsync; 0 means pace frames in software
     int fast_frames;    // consecutive frames that finished far too fast to be vsynced
     int quit;
@@ -1173,6 +1191,55 @@ static void App_UploadRootGrab(App *a, const CaptureRegion *region, const int sk
 // written is the topmost, which is what is on screen there once this window is discounted.  A
 // window below that is itself covered is corrected by whatever covers it in the same pass, so the
 // result is the screen's own answer rather than a guess.
+// Re-arms (or starts) damage reporting on a window about to be read: subtracting first means any
+// pixels it draws after this grab raise a fresh notify.
+static void App_TrackDamage(App *a, Window w)
+{
+    if (!a->sync_damage) {
+        return;
+    }
+    int i = 0;
+    while (i < a->damage_count && a->damage_win[i] != w) {
+        ++i;
+    }
+    if (i == a->damage_count) {
+        if (a->damage_count == (int)(sizeof(a->damage_win) / sizeof(a->damage_win[0]))) {
+            return;
+        }
+        a->damage_win[i] = w;
+        a->damage_id[i] = a->pDamageCreate(a->dpy, w, 3 /* XDamageReportNonEmpty */);
+        ++a->damage_count;
+    }
+    a->damage_seen[i] = 1;
+    a->pDamageSubtract(a->dpy, a->damage_id[i], None, None);
+}
+
+// Drops damage objects for windows this frame no longer read (gone, moved off the footprint or now
+// hidden).  A destroyed window's damage is already gone server-side, hence the quiet handler.
+static void App_PruneDamage(App *a)
+{
+    int kept = 0, dropped = 0;
+    int (*previous)(Display *, XErrorEvent *) = NULL;
+    for (int i = 0; i < a->damage_count; ++i) {
+        if (a->damage_seen[i]) {
+            a->damage_win[kept] = a->damage_win[i];
+            a->damage_id[kept] = a->damage_id[i];
+            a->damage_seen[kept] = 0;
+            ++kept;
+            continue;
+        }
+        if (!dropped++) {
+            previous = XSetErrorHandler(App_IgnoreXError);
+        }
+        a->pDamageDestroy(a->dpy, a->damage_id[i]);
+    }
+    if (dropped) {
+        XSync(a->dpy, False);
+        XSetErrorHandler(previous);
+    }
+    a->damage_count = kept;
+}
+
 static void App_GrabBeneath(App *a, const int cover[4])
 {
     Window root_ret = None, parent_ret = None;
@@ -1236,6 +1303,7 @@ static void App_GrabBeneath(App *a, const int cover[4])
             continue;
         }
         CaptureRegion grabbed;
+        App_TrackDamage(a, w);
         if (!Capture_GrabWindow(a->capture, w, x0 - attrs.x, y0 - attrs.y, x1 - x0, y1 - y0,
                                 &grabbed)) {
             continue;
@@ -1251,6 +1319,9 @@ static void App_GrabBeneath(App *a, const int cover[4])
     free(attrs_of);
     free(usable);
     XFree(children);
+    if (a->sync_damage) {
+        App_PruneDamage(a);
+    }
 }
 
 // Step 1 of the pipeline: the sampled rectangle as if this viewer were not on screen.
@@ -2995,6 +3066,10 @@ static void HandleEvents(App *a)
         // has been destroyed, and they carry its geometry; taking them for this window's is
         // how the borderless size kept reverting.  Root-window events are real -- the
         // target-area drag selects and grabs on the root.
+        if (a->damage_event_base && ev.type == a->damage_event_base /* XDamageNotify */) {
+            a->damaged = 1;
+            continue;
+        }
         if (ev.xany.window != a->win && ev.xany.window != a->root) {
             continue;
         }
@@ -3073,6 +3148,7 @@ static void Usage(const char *argv0)
         "  --borderless         start as a borderless window covering the screen\n"
         "  --no-outline         hide the capture-region outline\n"
         "  --no-hud             hide the bottom status strip (e.g. when streaming the output)\n"
+        "  --sync-damage        grab when the window beneath draws, not on a 60 Hz timer\n"
         "  --no-vsync           pace frames in software instead of waiting for vblank\n"
         "  --no-shm             force the XGetImage capture path (no MIT-SHM)\n"
         "  --pattern            use a built-in test pattern instead of the desktop\n"
@@ -3116,6 +3192,41 @@ static int ParseRect(const char *text, int *values, int count)
         }
     }
     return 1;
+}
+
+// --sync-damage pacing: return as soon as a window beneath has drawn (the flag may already be set
+// by events read during the frame), or at `deadline` so a still image keeps being presented.
+static void App_WaitForDamage(App *a, double deadline)
+{
+    static int by_damage, by_timeout;
+    static double waited;
+    const double t0 = NowSeconds();
+    while (!a->damaged && !a->quit) {
+        if (XPending(a->dpy)) {
+            HandleEvents(a);
+            continue;
+        }
+        const double left = deadline - NowSeconds();
+        if (left <= 0.0) {
+            break;
+        }
+        struct pollfd pfd = { ConnectionNumber(a->dpy), POLLIN, 0 };
+        poll(&pfd, 1, (int)(left * 1000.0) + 1);
+        HandleEvents(a);
+    }
+    if (a->damaged) {
+        ++by_damage;
+    } else {
+        ++by_timeout;
+    }
+    waited += NowSeconds() - t0;
+    if (by_damage + by_timeout == 120) {
+        Trace("sync-damage: %d woken by damage, %d by timeout, mean wait %.2f ms", by_damage,
+              by_timeout, waited * 1000.0 / 120.0);
+        by_damage = by_timeout = 0;
+        waited = 0.0;
+    }
+    a->damaged = 0;
 }
 
 int main(int argc, char **argv)
@@ -3163,6 +3274,8 @@ int main(int argc, char **argv)
             g_params.CaptureOutline = 0;
         } else if (!strcmp(arg, "--no-hud")) {
             g_no_hud = 1;
+        } else if (!strcmp(arg, "--sync-damage")) {
+            g_sync_damage = 1;
         } else if (!strcmp(arg, "--no-vsync")) {
             g_params.VSync = 0;
         } else if (!strcmp(arg, "--pattern")) {
@@ -3377,6 +3490,25 @@ int main(int argc, char **argv)
         Capture_DisableShm(app.capture);
     }
     app.using_shm = Capture_UsesShm(app.capture);
+    if (g_sync_damage) {
+        void *xdamage = dlopen("libXdamage.so.1", RTLD_NOW | RTLD_LOCAL);
+        Bool (*query)(Display *, int *, int *) =
+            xdamage ? (Bool (*)(Display *, int *, int *))dlsym(xdamage, "XDamageQueryExtension") : NULL;
+        if (xdamage) {
+            app.pDamageCreate = (unsigned long (*)(Display *, Drawable, int))dlsym(xdamage, "XDamageCreate");
+            app.pDamageDestroy = (void (*)(Display *, unsigned long))dlsym(xdamage, "XDamageDestroy");
+            app.pDamageSubtract = (void (*)(Display *, unsigned long, unsigned long, unsigned long))
+                dlsym(xdamage, "XDamageSubtract");
+        }
+        int event_base = 0, error_base = 0;
+        if (query && app.pDamageCreate && app.pDamageDestroy && app.pDamageSubtract &&
+            query(app.dpy, &event_base, &error_base)) {
+            app.sync_damage = 1;
+            app.damage_event_base = event_base;
+        } else {
+            fprintf(stderr, "supercrt: XDamage unavailable, --sync-damage ignored\n");
+        }
+    }
     app.marker = Marker_Create(app.dpy, app.screen);
     Marker_SetEnabled(app.marker, g_params.CaptureOutline);
     Marker_SetRect(app.marker, g_params.SrcX, g_params.SrcY, g_params.SrcWidth, g_params.SrcHeight);
@@ -3517,7 +3649,9 @@ int main(int argc, char **argv)
             }
         }
 
-        if (!g_params.VSync || !app.swap_control) {
+        if (app.sync_damage && app.damage_count > 0) {
+            App_WaitForDamage(&app, NowSeconds() + 0.05);
+        } else if (!g_params.VSync || !app.swap_control) {
             const double target = 1.0 / 60.0;
             const double elapsed = now - last_frame_time;
             if (elapsed < target) {

@@ -79,6 +79,7 @@ Assets are searched for as `assets/*` beside the binary, then `../assets`,
 | `--fullscreen` / `--borderless` | Start fullscreen (via WM) or as a borderless screen-sized window |
 | `--no-outline` | Hide the capture-region outline |
 | `--no-hud` | Hide the bottom status strip, e.g. when the output is being streamed |
+| `--sync-damage` | Grab the moment a window beneath draws (XDamage) instead of on the 60 Hz timer; a still image refreshes every 50 ms |
 | `--no-vsync` | Pace frames in software instead of waiting for vblank |
 | `--no-shm` | Force the `XGetImage` capture path |
 | `--pattern` | Built-in test pattern instead of the desktop |
