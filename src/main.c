@@ -1231,7 +1231,25 @@ static void App_GrabBeneath(App *a, const int cover[4])
 }
 
 // Step 1 of the pipeline: the sampled rectangle as if this viewer were not on screen.
+static void App_GrabSourceImpl(App *a);
+
+// Step 1, timed: SUPERCRT_TRACE=1 prints the mean grab cost every 120 frames, which is the number
+// the latency work is judged by.
 static void App_GrabSource(App *a)
+{
+    static double total;
+    static int frames;
+    const double t0 = NowSeconds();
+    App_GrabSourceImpl(a);
+    total += NowSeconds() - t0;
+    if (++frames == 120) {
+        Trace("grab: %.2f ms/frame (mean of %d)", total * 1000.0 / frames, frames);
+        total = 0.0;
+        frames = 0;
+    }
+}
+
+static void App_GrabSourceImpl(App *a)
 {
     CaptureRegion region;
     if (!Capture_Grab(a->capture, g_params.SrcX, g_params.SrcY, g_params.SrcWidth,

@@ -59,6 +59,17 @@ static int Capture_QuietXError(Display *dpy, XErrorEvent *ev)
     return 0;
 }
 
+static int g_shm_error, g_shm_req_major, g_shm_req_minor;
+
+static int Capture_ShmXError(Display *dpy, XErrorEvent *ev)
+{
+    (void)dpy;
+    g_shm_error = ev->error_code;
+    g_shm_req_major = ev->request_code;
+    g_shm_req_minor = ev->minor_code;
+    return 0;
+}
+
 static void Capture_FreeImage(Capture *c)
 {
     if (!c->image) {
@@ -248,8 +259,16 @@ int Capture_GrabDrawable(Capture *c, Drawable d, int x, int y, int width, int he
     }
 
     if (use_shm) {
-        if (!c->pGetImage(c->dpy, d, c->image, x, y, AllPlanes)) {
-            fprintf(stderr, "supercrt: XShmGetImage failed, falling back to XGetImage\n");
+        g_shm_error = 0;
+        int (*previous)(Display *, XErrorEvent *) = XSetErrorHandler(Capture_ShmXError);
+        const Bool ok = c->pGetImage(c->dpy, d, c->image, x, y, AllPlanes);
+        XSync(c->dpy, False);
+        XSetErrorHandler(previous);
+        if (!ok || g_shm_error) {
+            fprintf(stderr, "supercrt: XShmGetImage failed (X error %d, request %d.%d, %dx%d at "
+                            "%d,%d, depth %d), falling back to XGetImage\n",
+                    g_shm_error, g_shm_req_major, g_shm_req_minor, grab_w, grab_h, x, y,
+                    c->depth);
             c->use_shm = 0;
             Capture_FreeImage(c);
             c->image = NULL;
