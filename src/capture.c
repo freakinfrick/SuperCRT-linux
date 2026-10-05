@@ -352,7 +352,11 @@ int Capture_GrabWindow(Capture *c, Window win, int x, int y, int width, int heig
     if (px == None) {
         return 0;
     }
-    return Capture_GrabDrawable(c, px, x, y, width, height, out);
+    // NameWindowPixmap hands out a new pixmap on every call; not freeing it leaked one per window
+    // per frame, each pinning the window's old storage after a resize.
+    const int ok = Capture_GrabDrawable(c, px, x, y, width, height, out);
+    XFreePixmap(c->dpy, px);
+    return ok;
 }
 
 unsigned char *Capture_Data(const Capture *c)

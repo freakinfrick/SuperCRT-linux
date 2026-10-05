@@ -1190,20 +1190,41 @@ static void App_GrabBeneath(App *a, const int cover[4])
     // so all of it that can overlap the footprint is shape, not pixels.
     const Window mine = App_ToplevelUnder(a->dpy, a->root, a->win);
     const Window outline = a->marker ? Marker_Window(a->marker) : None;
-    int pieces = 0;
-    for (unsigned int i = 0; i < count; ++i) {
+
+    // One attribute fetch per window, then start at the topmost opaque window that hides the whole
+    // footprint: everything below it would be read only to be painted over.  With Dolphin windowed
+    // over its own fullscreen game list that halves the pixels read per frame.
+    XWindowAttributes *attrs_of = calloc(count, sizeof(*attrs_of));
+    unsigned char *usable = calloc(count, 1);
+    unsigned int first = 0;
+    for (unsigned int i = 0; attrs_of && usable && i < count; ++i) {
         const Window w = children[i];
-        if (w == mine || w == outline) {
+        XWindowAttributes *at = &attrs_of[i];
+        if (w == mine || w == outline || !XGetWindowAttributes(a->dpy, w, at) ||
+            at->map_state != IsViewable || at->class != InputOutput ||
+            at->depth != a->root_depth) {
             continue;
         }
-        XWindowAttributes attrs;
-        if (!XGetWindowAttributes(a->dpy, w, &attrs)) {
+        usable[i] = 1;
+        if (at->x <= cover[0] && at->y <= cover[1] && at->x + at->width >= cover[0] + cover[2] &&
+            at->y + at->height >= cover[1] + cover[3]) {
+            first = i;
+        }
+    }
+    if (!attrs_of || !usable) {
+        free(attrs_of);
+        free(usable);
+        XFree(children);
+        return;
+    }
+
+    int pieces = 0;
+    for (unsigned int i = first; i < count; ++i) {
+        const Window w = children[i];
+        if (!usable[i]) {
             continue;
         }
-        if (attrs.map_state != IsViewable || attrs.class != InputOutput ||
-            attrs.depth != a->root_depth) {
-            continue;
-        }
+        const XWindowAttributes attrs = attrs_of[i];
         const int x0 = cover[0] > attrs.x ? cover[0] : attrs.x;
         const int y0 = cover[1] > attrs.y ? cover[1] : attrs.y;
         const int x1 = (cover[0] + cover[2]) < (attrs.x + attrs.width) ? (cover[0] + cover[2])
@@ -1227,6 +1248,8 @@ static void App_GrabBeneath(App *a, const int cover[4])
 
     Trace("self-grab: cover %d,%d %dx%d from %d window(s)", cover[0], cover[1], cover[2], cover[3],
           pieces);
+    free(attrs_of);
+    free(usable);
     XFree(children);
 }
 
@@ -1251,15 +1274,23 @@ static void App_GrabSource(App *a)
 
 static void App_GrabSourceImpl(App *a)
 {
+    int cover[4];
+    const int covered = App_SourceCoverage(a, cover);
+    // The viewer covering the whole sampled rectangle (the fullscreen case) makes every root pixel
+    // there its own output, all of it about to be replaced from the windows beneath: skip that grab.
+    const int fully = covered && cover[0] == g_params.SrcX && cover[1] == g_params.SrcY &&
+                      cover[2] == g_params.SrcWidth && cover[3] == g_params.SrcHeight;
+
     CaptureRegion region;
-    if (!Capture_Grab(a->capture, g_params.SrcX, g_params.SrcY, g_params.SrcWidth,
-                      g_params.SrcHeight, &region)) {
+    memset(&region, 0, sizeof(region));
+    if (!fully && !Capture_Grab(a->capture, g_params.SrcX, g_params.SrcY, g_params.SrcWidth,
+                                g_params.SrcHeight, &region)) {
         return;
     }
 
     // Partly off screen: start from black, then blit what exists.
-    if (region.offset_x || region.offset_y || region.width != g_params.SrcWidth ||
-        region.height != g_params.SrcHeight) {
+    if (!fully && (region.offset_x || region.offset_y || region.width != g_params.SrcWidth ||
+                   region.height != g_params.SrcHeight)) {
         glBindFramebuffer(GL_FRAMEBUFFER, a->clear_fbo);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, a->clean_tex, 0);
         glViewport(0, 0, g_params.SrcWidth, g_params.SrcHeight);
@@ -1269,8 +1300,6 @@ static void App_GrabSourceImpl(App *a)
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
     }
 
-    int cover[4];
-    const int covered = App_SourceCoverage(a, cover);
     int skip[4] = { 0, 0, 0, 0 };
     if (covered) {
         skip[0] = cover[0] - g_params.SrcX;
@@ -1278,7 +1307,9 @@ static void App_GrabSourceImpl(App *a)
         skip[2] = cover[2];
         skip[3] = cover[3];
     }
-    App_UploadRootGrab(a, &region, covered ? skip : NULL);
+    if (!fully) {
+        App_UploadRootGrab(a, &region, covered ? skip : NULL);
+    }
     if (covered) {
         // Nothing may be found under the viewer -- bare desktop -- and a footprint left untouched
         // by both uploads keeps whatever the texture held, which on the first frames is
