@@ -26,11 +26,18 @@ struct Capture {
     int depth;
     int screen_w, screen_h;
 
+    // Two slots, never mixed: `image` is the MIT-SHM image (its pixels live in the shm segment) and
+    // `xlib_image` the fallback XGetImage result.  Sharing one slot let a fallback grab replace the
+    // SHM image, after which the next SHM grab ran on a non-SHM image, failed, and switched SHM off
+    // for good -- on every run that read a window beneath the viewer.  `last` is the slot the most
+    // recent grab filled, which is what Capture_Data and friends describe.
     XImage *image;
     int image_w, image_h;
-    int image_owned_by_xlib;
+    XImage *xlib_image;
+    XImage *last;
 
     int use_shm;
+    int shm_drawables;   // SHM for window pixmaps too; cleared on the first refusal for one
     void *xext;
     Bool (*pQueryExtension)(Display *);
     XImage *(*pCreateImage)(Display *, Visual *, unsigned int, int, char *,
@@ -75,9 +82,7 @@ static void Capture_FreeImage(Capture *c)
     if (!c->image) {
         return;
     }
-    if (c->image_owned_by_xlib) {
-        XDestroyImage(c->image);
-    } else {
+    {
         if (c->shm_attached) {
             c->pDetach(c->dpy, &c->shminfo);
             c->shm_attached = 0;
@@ -90,8 +95,10 @@ static void Capture_FreeImage(Capture *c)
         // segment, so only the struct may be freed.
         XFree(c->image);
     }
+    if (c->last == c->image) {
+        c->last = NULL;
+    }
     c->image = NULL;
-    c->image_owned_by_xlib = 0;
 }
 
 Capture *Capture_Create(Display *dpy, int screen)
@@ -132,6 +139,7 @@ Capture *Capture_Create(Display *dpy, int screen)
     if (c->pQueryExtension && c->pCreateImage && c->pAttach && c->pDetach && c->pGetImage &&
         c->pQueryExtension(dpy)) {
         c->use_shm = 1;
+        c->shm_drawables = 1;
     } else {
         fprintf(stderr, "supercrt: MIT-SHM unavailable, falling back to XGetImage "
                         "(slower for large capture regions)\n");
@@ -146,6 +154,9 @@ void Capture_Destroy(Capture *c)
         return;
     }
     Capture_FreeImage(c);
+    if (c->xlib_image) {
+        XDestroyImage(c->xlib_image);
+    }
     // Both libraries are left loaded: Xlib keeps per-extension callbacks that point into them and
     // walks them during XCloseDisplay, so unloading here risks jumping into freed code.
     (void)c->xext;
@@ -196,7 +207,7 @@ static int Capture_Resize(Capture *c, int width, int height)
     }
 
     if (!c->use_shm) {
-        // Allocated per grab in Capture_Grab via XGetImage.
+        // SHM setup failed: grabs go to the xlib_image slot instead.
         c->image = NULL;
     }
 
@@ -245,17 +256,16 @@ int Capture_GrabDrawable(Capture *c, Drawable d, int x, int y, int width, int he
 
     const int grab_w = width;
     const int grab_h = height;
-    const int use_shm = c->use_shm && d == c->root;
+    // MIT-SHM for the root and for window pixmaps of the screen's depth (the only kind the caller
+    // reads).  A refusal for a pixmap stops sharing for pixmaps only; one for the root stops it all.
+    int use_shm = c->use_shm && (d == c->root || c->shm_drawables);
+    c->last = NULL;
 
-    if (!c->image || c->image_w != grab_w || c->image_h != grab_h) {
-        if (use_shm) {
-            if (!Capture_Resize(c, grab_w, grab_h)) {
-                return 0;
-            }
-        } else {
-            c->image_w = grab_w;
-            c->image_h = grab_h;
+    if (use_shm && (!c->image || c->image_w != grab_w || c->image_h != grab_h)) {
+        if (!Capture_Resize(c, grab_w, grab_h)) {
+            return 0;
         }
+        use_shm = c->use_shm && c->image != NULL;
     }
 
     if (use_shm) {
@@ -264,29 +274,33 @@ int Capture_GrabDrawable(Capture *c, Drawable d, int x, int y, int width, int he
         const Bool ok = c->pGetImage(c->dpy, d, c->image, x, y, AllPlanes);
         XSync(c->dpy, False);
         XSetErrorHandler(previous);
-        if (!ok || g_shm_error) {
-            fprintf(stderr, "supercrt: XShmGetImage failed (X error %d, request %d.%d, %dx%d at "
-                            "%d,%d, depth %d), falling back to XGetImage\n",
-                    g_shm_error, g_shm_req_major, g_shm_req_minor, grab_w, grab_h, x, y,
-                    c->depth);
-            c->use_shm = 0;
-            Capture_FreeImage(c);
-            c->image = NULL;
+        if (ok && !g_shm_error) {
+            c->last = c->image;
+        } else {
+            fprintf(stderr, "supercrt: XShmGetImage failed on the %s (X error %d, request %d.%d, "
+                            "%dx%d at %d,%d), falling back to XGetImage for %s\n",
+                    d == c->root ? "root" : "window pixmap", g_shm_error, g_shm_req_major,
+                    g_shm_req_minor, grab_w, grab_h, x, y,
+                    d == c->root ? "everything" : "window pixmaps");
+            if (d == c->root) {
+                c->use_shm = 0;
+                Capture_FreeImage(c);
+            } else {
+                c->shm_drawables = 0;
+            }
         }
     }
-    if (!use_shm || !c->image) {
-        if (c->image && !c->image_owned_by_xlib) {
-            Capture_FreeImage(c);
-        } else if (c->image) {
-            XDestroyImage(c->image);
+    if (!c->last) {
+        if (c->xlib_image) {
+            XDestroyImage(c->xlib_image);
         }
-        c->image = XGetImage(c->dpy, d, x, y, (unsigned int)grab_w, (unsigned int)grab_h,
-                             AllPlanes, ZPixmap);
-        if (!c->image) {
+        c->xlib_image = XGetImage(c->dpy, d, x, y, (unsigned int)grab_w, (unsigned int)grab_h,
+                                  AllPlanes, ZPixmap);
+        if (!c->xlib_image) {
             fprintf(stderr, "supercrt: XGetImage failed\n");
             return 0;
         }
-        c->image_owned_by_xlib = 1;
+        c->last = c->xlib_image;
     }
 
     out->x = x;
@@ -343,20 +357,20 @@ int Capture_GrabWindow(Capture *c, Window win, int x, int y, int width, int heig
 
 unsigned char *Capture_Data(const Capture *c)
 {
-    return c->image ? (unsigned char *)c->image->data : NULL;
+    return c->last ? (unsigned char *)c->last->data : NULL;
 }
 
 int Capture_PixelsPerLine(const Capture *c)
 {
-    if (!c->image) {
+    if (!c->last) {
         return 0;
     }
-    return c->image->bytes_per_line / (c->image->bits_per_pixel / 8);
+    return c->last->bytes_per_line / (c->last->bits_per_pixel / 8);
 }
 
 int Capture_BitsPerPixel(const Capture *c)
 {
-    return c->image ? c->image->bits_per_pixel : 0;
+    return c->last ? c->last->bits_per_pixel : 0;
 }
 
 void Capture_DisableShm(Capture *c)

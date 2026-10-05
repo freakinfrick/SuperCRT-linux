@@ -31,8 +31,8 @@ int Capture_Grab(Capture *c, int x, int y, int width, int height, CaptureRegion 
 
 // Grabs from an arbitrary drawable instead of the root -- used to re-read the pixels under the
 // viewer from the window beneath it.  The region must already lie inside `d`: there is no screen
-// clipping here, because the caller has intersected it.  Only root grabs use MIT-SHM; a window
-// grab always goes through XGetImage, so a refusal cannot disable sharing for the common path.
+// clipping here, because the caller has intersected it.  Window pixmaps of the screen's depth use
+// MIT-SHM too; a refusal for one falls back to XGetImage for pixmaps only, never for the root.
 int Capture_GrabDrawable(Capture *c, Drawable d, int x, int y, int width, int height,
                          CaptureRegion *out);
 
