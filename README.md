@@ -4,6 +4,11 @@ Views a rectangle of your desktop through the CRT simulation from *Super Win the
 scanlines, shadow-mask, composite bleed, NTSC artifacts, bloom and all — on a real
 glass-tube-shaped mesh, drawn live over your desktop.
 
+Because it captures the screen and draws over it, the viewer adds a frame or so of input lag. For
+the Dolphin GameCube/Wii emulator there is a lag-free alternative that runs inside the
+emulator's own frame: [dolphin-crt](https://github.com/freakinfrick/dolphin-crt), a single-pass
+CRT post-processing shader (scanlines, curvature, mask and bloom; no bezel or glass reflections).
+
 ## Credit
 
 **The CRT simulation in this repository is not my work.** It is a port of **CRTSim**, the
